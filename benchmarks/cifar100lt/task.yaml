@@ -1,0 +1,56 @@
+name: cifar100lt
+domain: computer vision
+subdomain: Long-Tailed Learning
+description: |
+  Build an image classifier for CIFAR-100-LT, a long-tailed version of CIFAR-100 with imbalance ratio 100. The training set follows an exponential class distribution (500 → 5 samples per class across 100 classes). The test set is balanced (100 images per class). The challenge is to achieve high accuracy despite extreme class imbalance.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train.pt: dict with keys "images" (uint8 tensor, shape [N, 3, 32, 32]) and "labels" (int64 tensor, shape [N])
+    - val.pt:   same format as train.pt
+    - class_counts.json: dict mapping class index (str) to training sample count, useful for designing class-balanced losses
+
+  Images are raw pixel values 0-255 (uint8), in CHW format. N is ~10,626 for train (long-tailed) and ~1,000 for val (balanced subset). Labels are integers 0-99.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains test.pt with same format as train.pt (images + labels).
+         Your script should ONLY use the "images" key (labels are ground truth).
+  Output: JSON file with format {"predictions": [42, 7, 99, 0, ...]}
+          One predicted class index (int 0-99) per test sample, in order.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/cifar100lt/
+test_data_dir: /rab_data/cifar100lt_test/
+docker_image: farbench/farbench:cifar100lt-cu118
+
+# Evaluation
+primary_metric: balanced_accuracy
+higher_is_better: true
+evaluator_class: benchmarks.cifar100lt.script.evaluator.CIFAR100LTEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.pt containing {'images': uint8 [N,3,32,32], 'labels': int64 [N]}"
+  output_format: '{"predictions": [42, 7, 99, 0, ...]}'
+
+# Constraints
+# budget-review 2026-04-20: CIFAR-100-LT (~10-50k 32x32), ResNet-32/50 + rebalancing strategies, 1 GPU 1h fits 1-2 full training runs. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 3
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): lightly
+
+  Pre-downloaded pretrained models (no network needed):
+    - CLIP ViT-B/16 (86M) — via timm: timm.create_model('vit_base_patch16_clip_224.openai', pretrained=True)
+    - torchvision: resnet50 (IMAGENET1K_V2, 25M) — torchvision.models.resnet50(weights='IMAGENET1K_V2')
+    - timm: convnext_tiny.fb_in22k_ft_in1k (28M) — timm.create_model('convnext_tiny.fb_in22k_ft_in1k', pretrained=True)

@@ -1,0 +1,199 @@
+name: screenspot_pro
+domain: computer vision
+subdomain: Visual Grounding
+description: |
+  Train a GUI grounding model that locates UI targets from natural-language
+  instructions in professional desktop software screenshots, evaluated on the
+  held-out ScreenSpot-Pro test set.
+
+  ## Compute & data layout
+
+  Training data lives at `/data` inside the sandbox container (= `FARBENCH_DATA_DIR`;
+  the bytes are packaged in the Docker image):
+
+    /data/
+      unified_train.jsonl        # ~7100 rows
+      unified_val.jsonl          # ~400  rows  (image-disjoint split)
+      images/<image_id>.png      # ~1500 unique source screenshots
+      dataset_info.json
+      base_model/
+        Qwen2.5-VL-3B-Instruct/  # pre-snapshotted, load offline
+
+  Test data lives at `<test_data_dir>` (= `/data` in the eval container):
+
+    test_prompts.jsonl    # visible to the agent (no labels)
+    test_labels.jsonl     # hidden, evaluator-only
+    images/<image_id>.png
+    dataset_info.json
+
+  Everything is materialized into the task image under `/rab_data`; FARBench maps
+  `/data` to the train split in the sandbox and to the test split during eval. The container has
+  `network_access: false`, so do NOT try to download anything at runtime —
+  Qwen2.5-VL-3B is already on disk.
+
+  ## Training data: showlab/ShowUI-desktop
+
+  Source repo: `showlab/ShowUI-desktop` (a.k.a. ShowUI-desktop-8K), originally
+  sourced from OmniAct and re-captioned by GPT-4o into multiple instruction
+  variants per UI element (`type` ∈ {original, appearance, spatial, intent}).
+  We re-format every row into the same JSONL schema as the test set, convert
+  bbox/point from ShowUI's normalized [0,1] coords to ABSOLUTE pixels, and
+  hash-split by `image_url` so augmented variants of the same screenshot stay
+  in the same split (no train→val leakage).
+
+  ## Test data: likaixin/ScreenSpot-Pro
+
+  Held-out professional-software grounding benchmark (CAD, 3D modeling,
+  scientific computing, IDEs, ...). Same JSONL schema as training data; the
+  evaluator joins on `id`.
+
+  ## JSONL row schema (train, val, test_prompts, test_labels)
+
+    {
+      "id":           "showui-XXXXXXXXXXXX-r000123" | "sspro-000001",
+      "image_path":   "images/<image_id>.png",     # relative to its dir
+      "instruction":  "Click the Run button",      # absent in test_labels
+      "target_bbox":  [x1, y1, x2, y2],            # ABSOLUTE pixels, XYXY (optional)
+      "target_point": [x, y],                       # ABSOLUTE pixels, XY    (optional)
+      "image_width":  1920,
+      "image_height": 1080,
+      "source":       "ShowUI-desktop" | "ScreenSpot-Pro",
+      "type":         "original" | "appearance" | "spatial" | "intent"   # train only
+    }
+
+  Each row carries either `target_bbox`, `target_point`, or both. `predict.py`
+  may answer with either form per sample.
+
+  ## Predict script contract
+
+    python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>
+
+  Inputs the script can read:
+    - <test_data_dir>/test_prompts.jsonl
+    - <test_data_dir>/images/*.png
+    - <test_data_dir>/dataset_info.json
+  (test_labels.jsonl is NOT mounted into the eval container by FARBench.)
+
+  Required output JSON:
+    {
+      "predictions": [
+        {"id": "sspro-000001", "bbox":  [x1, y1, x2, y2]},
+        {"id": "sspro-000002", "point": [x, y]},
+        ...
+      ]
+    }
+
+  Coordinates MUST be absolute pixels (XYXY for bbox, XY for point), clipped
+  to image bounds. Either `bbox` or `point` per sample is accepted; if both
+  are provided, the evaluator prefers the modality matching the ground truth.
+
+  ## Evaluation metric
+
+  `grounding_score` = (#correct) / (#test samples), where a prediction counts
+  as correct iff:
+    - bbox vs. target_bbox: IoU ≥ 0.5, OR
+    - point vs. target_point: L2 distance ≤ 14 px.
+  Missing or invalid predictions count as wrong (not skipped).
+
+  Auxiliary metrics returned alongside: `mean_iou` (over bbox samples),
+  `mean_point_distance_px` (over point samples), `num_correct`, `total`,
+  `num_missing_or_invalid`.
+
+compute_type: gpu
+# Qwen2.5-VL-3B fine-tuning is the bottleneck. With LoRA/QLoRA and bf16 it
+# fits comfortably on a single 32 GB card (5090 / L40S / A6000 Ada); 4-bit
+# QLoRA can fit it on 24 GB. 2 GPUs lets the agent (a) DDP across two cards
+# for ~1.7x training throughput, or (b) keep one card for parallel eval
+# rollouts while the other trains. CPU is mostly used for image preprocessing
+# / tokenization, so 32 cores + 128 GB RAM is plenty.
+max_gpu_count: 2
+max_cpu_cores: 32
+max_memory_gb: 128
+per_gpu_memory_gb: 32
+total_time_budget_hours: 10
+max_iterations: 30
+network_access: false
+# The base model is Qwen2.5-VL-3B (~3.8B params with vision encoder).
+# Allow some headroom for full-finetuning experiments / 7B base swaps but
+# keep the cap below the 8B class so the eval container stays within
+# per_gpu_memory_gb at fp16 inference.
+max_model_params_billion: 8.0
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/screenspot_pro/
+test_data_dir: /rab_data/screenspot_pro_test/
+docker_image: farbench/farbench:screenspot_pro-cu118
+
+# Evaluation
+primary_metric: grounding_score
+higher_is_better: true
+evaluator_class: benchmarks.screenspot_pro.script.evaluator.ScreenSpotProEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>"
+  input_format: "<test_data_dir>/test_prompts.jsonl + <test_data_dir>/images/<image_id>.png + <test_data_dir>/dataset_info.json. Each prompt row: {id, image_path, instruction, image_width, image_height}."
+  output_format: '{"predictions": [{"id": str, "bbox": [x1,y1,x2,y2]} | {"id": str, "point": [x,y]}]} — absolute pixels, XYXY/XY, clipped to image bounds.'
+
+agent_hints: |
+  ── Files you have ─────────────────────────────────────────────────────────
+  /data/unified_train.jsonl          # ~7100 rows  (training)
+  /data/unified_val.jsonl            # ~400  rows  (image-disjoint val split)
+  /data/images/<image_id>.png        # ~1500 unique screenshots
+  /data/dataset_info.json            # split stats + schema
+  /data/base_model/Qwen2.5-VL-3B-Instruct/   # offline-loadable base model
+
+  Use the val split to size your hyperparameters BEFORE producing final
+  predictions. Each image_id is unique to a single split, so val accuracy is
+  a clean estimate of test generalization.
+
+  ── Coordinate convention (CRITICAL) ───────────────────────────────────────
+  Both training and test labels are in ABSOLUTE pixels, XYXY for bbox, XY
+  for point, clipped to image bounds. ShowUI's original normalized [0,1]
+  coords have already been converted for you in unified_*.jsonl — do NOT
+  re-normalize.
+
+  Qwen2.5-VL outputs token strings like "<box>x1 y1 x2 y2</box>" or
+  "<point>x y</point>" using the model's INTERNAL grid (default 1000×1000
+  for VL). When you decode model output to absolute pixels for predict.py,
+  rescale with the same image_width / image_height you fed at inference.
+  Failing this step is the #1 reason grounding_score collapses to ~0.
+
+  ── Recommended workflow ───────────────────────────────────────────────────
+  1) Build a robust text→bbox/point parser that handles all of:
+       <box>123 456 789 1011</box>
+       <bbox>(123,456),(789,1011)</bbox>
+       (123, 456, 789, 1011)
+       point: 234, 567
+     and unit-test it against a handful of unified_train.jsonl rows.
+  2) LoRA / QLoRA fine-tune Qwen2.5-VL-3B on a subset (start with 2k–4k rows)
+     using TRL or transformers' Trainer. 1-2 epochs with lr ~1e-4 on the
+     LoRA layers is a strong baseline; full fine-tune is overkill.
+  3) Sanity-check on unified_val.jsonl: aim for grounding_score ≥ 0.30 on
+     val before producing test predictions; this is comparable to the
+     pretrained baseline reported in the ShowUI / OS-Atlas papers.
+  4) For predict.py:
+       - Stream rows from test_prompts.jsonl one by one (200+ rows; batch
+         size > 1 is fine if your GPU has memory headroom).
+       - Open the image from os.path.join(args.data_path, row["image_path"]).
+       - At inference, pass image_width / image_height through to your
+         decoding step so coordinates land in absolute pixel space.
+       - Clip every coordinate to [0, image_width] / [0, image_height].
+       - Output exactly one entry per `id`. Missing IDs count as wrong.
+
+  ── Common pitfalls ────────────────────────────────────────────────────────
+  1. Forgetting to clip to image bounds → off-by-N errors that throw IoU
+     below the 0.5 threshold.
+  2. Outputting normalized coords (0..1) instead of absolute pixels → IoU
+     becomes essentially zero on any image bigger than ~1×1 pixels.
+  3. Fine-tuning with the wrong target string format. Match Qwen2.5-VL's
+     own grounding template or your parser will silently mis-extract every
+     coordinate.
+  4. Using transformers' default image tokenizer without setting
+     min_pixels / max_pixels can blow VRAM on 3360×2100 screenshots.
+     Cap with e.g. `processor = AutoProcessor.from_pretrained(..., min_pixels=256*28*28, max_pixels=1280*28*28)`.
+  5. Network is OFF — `from_pretrained("Qwen/...")` will fail with HF lookup
+     errors. Always pass the local path `/data/base_model/Qwen2.5-VL-3B-Instruct`.
+  6. Don't shuffle val into train mid-experiment; the evaluator uses image-
+     disjoint splits and you'll overfit memorized layouts otherwise.

@@ -1,0 +1,172 @@
+name: cogniplan
+domain: robotics
+subdomain: Autonomous Exploration
+description: |
+  Train an exploration planner for autonomous robot mapping in unknown 2D
+  environments. The robot must efficiently navigate and map unknown spaces
+  (rooms, tunnels, outdoor areas) while maximising exploration coverage and
+  minimising travel distance.
+
+  Primary metric: exploration_score (higher is better) — combines success rate and
+  path efficiency:
+    exploration_score = (1/N) * Σ [ S_i * (300 / d_i) ]
+  where S_i is binary success (explored_rate > 0.9999), d_i is travel distance (m),
+  and 300 m is a reference distance. Failed episodes contribute 0. Successful
+  episodes with shorter paths score higher.
+  Secondary metrics: success_rate, travel_distance.
+
+  ## Task Description
+
+  A robot starts at a fixed position (marked in the map) in an unknown 2D occupancy
+  grid map. At each planning step the robot:
+    1. Scans surroundings via a 360° raycasting sensor (16 m range, 0.5° resolution).
+    2. Updates the explored belief map (FREE=255, OCCUPIED=1, UNKNOWN=127).
+    3. Selects a neighbouring node from the exploration graph to move to.
+    4. Moves to that node; travel distance is accumulated in metres.
+
+  Navigation uses a sparse graph of free nodes spaced NODE_RESOLUTION=3.6 m apart.
+  Each node has a utility value (number of observable frontier cells within 12.8 m).
+  The episode ends when explored_rate > 0.9999, or no nodes have utility > 0,
+  or 128 planning steps are exhausted.
+
+  ## Environment
+
+  The CogniPlan exploration environment is pre-installed. It provides a
+  2D grid-based simulation with no rendering requirements.
+
+  Constants (matching official CogniPlan):
+    CELL_SIZE        = 0.4 m/cell
+    NODE_RESOLUTION  = 3.6 m
+    SENSOR_RANGE     = 16.0 m
+    SUCCESS_THRESHOLD = 0.9999
+    MAX_EPISODE_STEP = 128
+
+  Quick-start example:
+
+    from cogniplan_env import ExplorationEnv
+
+    env = ExplorationEnv(map_path="path/to/map.png")
+    obs = env.reset()
+    # obs keys:
+    #   "global_map":    uint8 (H, W) — belief map (FREE=255, OCCUPIED=1, UNKNOWN=127)
+    #   "robot_pos":     float32 (2,) — robot (x, y) in metres
+    #   "frontiers":     list[(float, float)] — frontier coords in metres
+    #   "nodes":         list[dict] — graph nodes {coords, utility, visited, neighbors}
+    #   "neighbors":     list[(float, float)] — reachable neighbour node coords (metres)
+    #   "explored_rate": float — fraction of free cells explored so far
+
+    for step in range(128):
+        target = select_waypoint(obs)   # choose from obs["neighbors"]
+        obs, info = env.step(target)    # target is (x, y) in metres
+        if info["done"]:
+            break
+
+    metrics = env.get_metrics()
+    # {"explored_rate": 0.9999, "travel_distance": 245.3, "n_steps": 87, "success": True}
+
+  ## Data Format
+
+  Training maps are at $FARBENCH_DATA_DIR (/data in container):
+    - maps_train/     — training maps (PNG grayscale images)
+        room/         — indoor room-like environments
+        tunnel/       — narrow corridor environments
+        outdoor/      — open outdoor-like environments
+    - meta.json       — metadata:
+        "n_maps_train": 6000, "n_maps_eval": 150,
+        "env_types": ["room", "tunnel", "outdoor"],
+        "sensor_range": 16.0, "max_steps": 128,
+        "success_threshold": 0.9999
+
+  Each map is a grayscale PNG: pixel 255=free, pixel 127=wall, pixel 208=start position.
+  The environment binarises internally: free (>150 or 50–80) → FREE=255, else OCCUPIED=1.
+
+  ## Predict Script Contract
+
+  You MUST create predict.py in /workspace that:
+    1. Loads your trained model from --checkpoint directory.
+    2. Runs evaluation on all maps listed in eval_config.json.
+    3. Writes a JSON results file to --output.
+
+  Invocation:
+    python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>
+
+  Input: --data_path contains:
+    eval_config.json  — evaluation specification
+    maps_eval/        — evaluation maps (room/, tunnel/, outdoor/)
+
+  Output JSON format (required):
+    {
+      "explored_rate": 0.95,
+      "travel_distance": 280.5,
+      "success_rate": 0.72,
+      "per_episode": [
+        {"map_path": "room/map_001.png", "env_type": "room",
+         "success": 1, "travel_distance": 245.3, "explored_rate": 0.9999},
+        ...
+      ],
+      "per_type": {
+        "room":    {"explored_rate": 0.97, "travel_distance": 220.1, "success_rate": 0.84},
+        "tunnel":  {"explored_rate": 0.94, "travel_distance": 310.2, "success_rate": 0.68},
+        "outdoor": {"explored_rate": 0.93, "travel_distance": 311.3, "success_rate": 0.64}
+      },
+      "total_episodes": 150
+    }
+
+  per_episode:      REQUIRED — list of per-episode results. Each entry must include
+                    "success" (0 or 1), "travel_distance" (metres), and "explored_rate".
+                    The evaluator computes exploration_score from this data.
+  explored_rate:    mean fraction of free space explored across all episodes.
+  travel_distance:  mean distance traveled in metres across *successful* episodes only
+                    (explored_rate > 0.9999). If no episodes succeed, report 0.0.
+  success_rate:     fraction of episodes where explored_rate > 0.9999 within 128 steps.
+
+  ## Execution Priority
+
+  Submit evaluation after each training run to track progress.
+  Iterate based on eval results — do not train multiple times without evaluating.
+
+  ## Constraints
+
+  - Network architecture is free but total parameters must be <= 50M.
+  - You may use any planning/RL algorithm.
+  - The environment is deterministic given a map and start position.
+
+compute_type: gpu
+# budget-review 2026-04-20: CogniPlan 2D exploration RL, lightweight grid sim (no rendering), small policy net, 1 GPU 4h fits multi-seed experiments. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 4
+max_iterations: 30
+network_access: false
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/cogniplan/
+test_data_dir: /rab_data/cogniplan_test/
+docker_image: farbench/farbench:cogniplan-cu118
+# Evaluation
+primary_metric: exploration_score
+higher_is_better: true
+evaluator_class: benchmarks.cogniplan.script.evaluator.CogniPlanEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>"
+  input_format: "data_path contains eval_config.json + maps_eval/ directory with room/, tunnel/, outdoor/ subdirs"
+  output_format: '{"explored_rate": 0.95, "travel_distance": 280.5, "success_rate": 0.72, "per_episode": [...], "per_type": {...}, "total_episodes": 150}'
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): torch, ray, scikit-image,
+    opencv-python, cogniplan_env (custom exploration environment)
+
+  IMPORTANT RULES for this task:
+  - You MUST use the cogniplan_env.ExplorationEnv for training and evaluation.
+    Do NOT create mock/fake/simplified environments. The evaluator runs your
+    planner in the real ExplorationEnv — any planner not compatible will score 0.
+  - Training data is collected by interacting with ExplorationEnv (on-policy).
+    Load maps from /data/maps_train/ to create environments.
+  - eval_config.json in $FARBENCH_TEST_DATA_DIR specifies evaluation parameters.
+  - The environment is headless (no display needed). All observations are
+    numpy arrays.
+
+  Pre-cached models (no network needed):
+    - ResNet-50 (~98MB) — torchvision.models.resnet50(weights='IMAGENET1K_V1')

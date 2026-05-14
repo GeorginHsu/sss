@@ -1,0 +1,78 @@
+name: scanobjectnn
+domain: Computer Vision
+subdomain: 3D Point Cloud Classification
+description: |
+  Build a 3D point cloud classifier for real-world scanned objects (15 categories).
+  This uses the ScanObjectNN PB_T50_RS variant — the hardest setting with perturbed
+  bounding boxes (50% translation, rotation, scaling), background clutter, and occlusion
+  from real indoor scans. You may use ImageNet-pretrained 2D vision backbones, but do NOT
+  use pretrained models from 3D point cloud datasets (ShapeNet, ModelNet, etc.).
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - meta.json: metadata with fields:
+        "num_classes": 15
+        "num_points": 2048
+        "variant": "PB_T50_RS"
+        "class_names": ["bag","bed","bin","box","cabinet","chair","desk","display","door","pillow","shelf","sink","sofa","table","toilet"]
+    - train.pt: dict with keys:
+        "points": float32 tensor [N_train, 2048, 3] (xyz coordinates, NOT normalized)
+        "labels": int64 tensor [N_train] (class indices 0-14)
+      ~10,274 training samples.
+    - val.pt: same format, ~1,142 validation samples (10% stratified holdout from training set).
+
+  Each sample is a point cloud of 2048 points with (x, y, z) coordinates from real 3D scans.
+  Points are NOT pre-normalized — whether and how to normalize is a design choice.
+
+  15 classes: bag(0), bed(1), bin(2), box(3), cabinet(4), chair(5), desk(6), display(7),
+  door(8), pillow(9), shelf(10), sink(11), sofa(12), table(13), toilet(14).
+
+  Key constraint: Do NOT use pretrained models from ShapeNet, ModelNet, or other 3D point cloud
+  datasets. ImageNet-pretrained 2D backbones (provided in the container) are allowed.
+
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: --data_path is a DIRECTORY. Load test data with:
+           test_data = torch.load(os.path.join(args.data_path, 'test.pt'))
+         Use ONLY the "points" key (labels are ground truth, never use them).
+         Test set: ~2,882 point clouds, each [2048, 3] float32.
+  Output: JSON file with format {"predictions": [5, 13, 0, 14, ...]}
+          One predicted class index (int 0-14) per test sample, in order.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/scanobjectnn/
+test_data_dir: /rab_data/scanobjectnn_test/
+docker_image: farbench/farbench:scanobjectnn-cu118
+
+# Evaluation
+primary_metric: overall_accuracy
+higher_is_better: true
+evaluator_class: benchmarks.scanobjectnn.script.evaluator.ScanObjectNNEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.pt containing {'points': float32 [N,2048,3], 'labels': int64 [N]}"
+  output_format: '{"predictions": [5, 13, 0, 14, ...]}'
+
+# Constraints
+# budget-review 2026-04-20: ScanObjectNN point-cloud classification (must train from scratch, no pretrained weights), PointNet++/DGCNN/PointMLP <4h/run on 1 GPU. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 6
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): gdown
+
+  Pre-downloaded 2D ImageNet backbones (no network needed, for P2P-style point-to-pixel approaches):
+    - torchvision: resnet50 (IMAGENET1K_V2, 25M) — torchvision.models.resnet50(weights='IMAGENET1K_V2')
+    - timm: convnext_tiny.fb_in22k_ft_in1k (28M) — timm.create_model('convnext_tiny.fb_in22k_ft_in1k', pretrained=True)
+    - DINOv2 ViT-B/14 (86M) — AutoModel.from_pretrained('facebook/dinov2-base')
+    - CLIP ViT-B/16 (86M) — timm.create_model('vit_base_patch16_clip_224.openai', pretrained=True)

@@ -1,0 +1,61 @@
+name: voicebank_demand
+domain: audio/speech understanding
+subdomain: Speech Enhancement
+description: |
+  Build a single-channel speech enhancement model on the VoiceBank+DEMAND dataset — given a noisy speech waveform, produce a clean (denoised) waveform. Training data contains paired clean/noisy utterances at various SNR levels. The test set uses unseen speakers and unseen noise types at different SNR levels.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - clean/:  clean speech WAV files (16 kHz, mono), 10,415 files from 28 speakers (11,572 total training utterances minus 1,157 held-out for validation)
+    - noisy/:  corresponding noisy speech WAV files, same filenames as clean/
+    - val_clean/:  1,157 clean validation WAV files (10% of 11,572 original training utterances, split with fixed seed 42)
+    - val_noisy/:  1,157 noisy validation WAV files, same filenames as val_clean/
+
+  Each noisy file is the corresponding clean file mixed with noise from the DEMAND database at SNR levels 0/5/10/15 dB. Filenames match between clean/ and noisy/ (and val_clean/ and val_noisy/) directories. Use the validation set for hyperparameter tuning, early stopping, or model selection.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains noisy/ directory with 824 noisy test WAV files (16 kHz mono) and test_files.txt (one filename per line, defines evaluation order).
+  Output: Save enhanced WAV files (16 kHz, mono) to a directory, then write a JSON file: {"predictions_dir": "<absolute_path_to_enhanced_wavs>/"}
+          Enhanced files must have the same filenames as the noisy inputs. Do NOT resample — keep 16 kHz.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/voicebank_demand/
+test_data_dir: /rab_data/voicebank_demand_test/
+docker_image: farbench/farbench:voicebank_demand-cu118
+
+# Evaluation
+primary_metric: pesq
+higher_is_better: true
+evaluator_class: benchmarks.voicebank_demand.script.evaluator.VoiceBankDemandEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "noisy/ directory with .wav files + test_files.txt listing filenames"
+  output_format: '{"predictions_dir": "/path/to/enhanced_wavs/"}'
+
+# Constraints
+# budget-review 2026-04-20: VoiceBank-DEMAND speech enhancement (~11.5k utts), CMGAN/MetricGAN+/Conv-TasNet, 1 GPU 6h fits training + tuning. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 6.0
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): pesq, pystoi, audiomentations, speechbrain, asteroid, pyloudnorm, auraloss
+
+  Available architecture blocks (offline, inspect with help() / dir()):
+    - torchaudio.models:                         Conformer, WaveRNN, Tacotron2, ConvTasNet, HDemucs
+    - speechbrain.lobes.models.transformer:      Conformer, Transformer, Branchformer
+    - asteroid.models:                           ConvTasNet, DPRNN, DPTNet, SuDORM-RF (SE-specific)
+    - auraloss.freq / auraloss.time:             MultiResolutionSTFTLoss, MelSTFTLoss, SDRLoss, SISDRLoss
+
+  Pre-downloaded model (no network needed):
+    - speechbrain/metricgan-plus-voicebank
+    Load via: SpectralMaskEnhancement.from_hparams(source='speechbrain/metricgan-plus-voicebank', savedir='/opt/pretrained_models/metricgan-plus-voicebank')

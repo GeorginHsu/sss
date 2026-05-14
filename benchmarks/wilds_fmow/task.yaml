@@ -1,0 +1,106 @@
+name: wilds_fmow
+domain: AI for Science
+subdomain: Remote Sensing
+description: |
+  Build a satellite image classifier for 62 land-use categories that generalizes across time (temporal distribution shift) and across 5 geographic regions. Evaluation metric is worst-region accuracy on OOD test images: per-region accuracy is computed over {Africa, Americas, Asia, Europe, Oceania} and the MINIMUM is reported (samples with region=-1/"Other" are excluded from worst-region but counted in overall_accuracy). Splits follow the official WILDS v1.1 OOD protocol bit-for-bit — identical to WILDS leaderboard submissions (ERM, FLYP, AutoFT, DRM, VDPG): train = year 2002-2012, val = OOD year 2013-2015, test = OOD year 2016-2017. Sample counts (WILDS published): train ≈ 76,863 / val ≈ 19,915 / test ≈ 22,108. Exact counts are printed by prepare.py at setup time and match the WILDS Python loader's subsets exactly.
+
+  ## Data Format
+
+  Training data at $FARBENCH_DATA_DIR (/data in container, ~45-50 GB on disk):
+    - train.txt            : N_train lines of "rgb_img_{idx}.png {label}" (space-separated, label ∈ [0,61], whitespace-free)
+    - val.txt              : N_val   lines of "rgb_img_{idx}.png {label}" (OOD val, 2013-2015)
+    - region_labels_train.txt : N_train lines, one integer per line (aligned by line index to train.txt)
+    - region_labels_val.txt   : N_val   lines, same format as above
+    - class_names.txt      : 62 lines, one class name per line (line index == class index 0-61)
+    - images/              : flat directory of .png files (real files, ~96K total = train + val combined); fully self-contained, no external dependencies
+
+  Test data at $FARBENCH_TEST_DATA_DIR (/data in the eval container), given to predict.py:
+    - test.txt             : N_test lines of "rgb_img_{idx}.png" ONLY — no label column
+    - images/              : flat directory with the test PNGs
+    (test_labels.txt and test_regions.txt also live in this directory; they are used by the evaluator. predict.py MUST only read test.txt and images/ — reading the label files is considered cheating.)
+
+  Image spec (identical for all splits):
+    - Format:      PNG, RGB, 3 channels, 8-bit unsigned (pixel range 0-255)
+    - Size:        224 × 224 (already resized by WILDS v1.1; standard ImageNet input size)
+    - Filename:    rgb_img_{idx}.png where {idx} is the original row index in WILDS rgb_metadata.csv (gaps are normal — do NOT assume contiguous indices)
+    - Content:     RGB satellite imagery captured between 2002-2017; resolution of the source imagery varies but all samples are resampled to 224×224
+    - Normalization: pixel values are raw uint8 (0-255), NOT pre-normalized. Apply your model's own mean/std normalization after loading.
+
+  Region encoding (regions derived from country_code via country_code_mapping.csv):
+    0 = Africa
+    1 = Americas
+    2 = Asia
+    3 = Europe
+    4 = Oceania
+   -1 = Other / Unknown country (excluded from worst-region metric but still appears in train/val — very rare, ~0.05% of train and ~0.02% of test based on actual prepared data)
+    Region label files are ONE integer per line, aligned to the corresponding .txt file by line index. Using region metadata during training is optional — the predict.py contract does not require it.
+
+  Label encoding:
+    - Labels are integers in [0, 61] covering 62 FMoW land-use categories (airport, aquaculture, barn, crop_field, educational_institution, hospital, shopping_mall, stadium, wind_farm, zoo, ...).
+    - See class_names.txt for the full canonical list (line N = class N).
+    - Class distribution is heavily imbalanced — popular classes (crop_field, single-unit_residential, educational_institution) have 10-20K samples; rare classes (helipad, debris_or_rubble, nuclear_powerplant) have a few hundred.
+    - Year and region distributions are also imbalanced — training data is skewed toward Americas & earlier years; OOD test spans years 2016-2017 across all 5 regions.
+
+  Why this task is hard (context only, no method implied):
+    - Temporal distribution shift: cities grow, construction sites become buildings, landscapes change 2002→2017
+    - Geographic shift: regions differ systematically in building styles, vegetation, and infrastructure; the training set is NOT uniformly distributed across regions
+    - Worst-region metric penalizes models that fit majority regions well but fail on minority regions
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: <test_data_dir> contains test.txt (one "rgb_img_{idx}.png" per line, NO labels) and images/ (the .png files referenced by test.txt).
+  Output: JSON file at <output.json> with format {"predictions": [14, 0, 55, 3, ...]}
+          One predicted class index (int in [0,61]) per test sample, in the SAME order as test.txt lines. Length MUST equal len(test.txt).
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/wilds_fmow/
+test_data_dir: /rab_data/wilds_fmow_test/
+docker_image: farbench/farbench:wilds_fmow-cu118
+
+# Evaluation
+primary_metric: worst_region_accuracy
+higher_is_better: true
+evaluator_class: benchmarks.wilds_fmow.script.evaluator.WildsFMoWEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.txt with lines of 'relative_path' + images/ directory (no labels)"
+  output_format: '{"predictions": [14, 0, 55, 3, ...]}'
+
+# Constraints
+# budget-review 2026-04-24: FMoW WILDS OOD protocol (train ~77K / val ~20K / test ~22K, 62 classes).
+# Target hardware: 4x RTX 6000 Ada (48GB each). Per card ~1.2x A100 FP16 TC => 4 cards ≈ 4.8x A100.
+# Literature single-run times on 1-2 A100 (CLIP ViT-L/14 fine-tune): 4-8h.
+# Scaled to 4x 6000 Ada DDP: ~1-2h per ViT-L run, ~0.5-1h per ViT-B run.
+# 10h budget => agent has room for 5+ full ViT-L training runs (matches skill's "5x single run" rule).
+max_gpu_count: 4
+total_time_budget_hours: 10
+max_iterations: 30
+network_access: false
+# 4-GPU DDP with ~8 dataloader workers/GPU on 224x224 PNG decode; 48 cores
+# keeps PIL/augmentation from bottlenecking IO. 96 GB RAM covers ~32 worker
+# processes (~1 GB each) + val-set pre-cache + DDP communication buffers
+# (default 48 GB is tight and risks OOM under persistent_workers/larger prefetch).
+max_cpu_cores: 48
+max_memory_gb: 96
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): wilds
+
+  Pre-downloaded pretrained models (no network needed, available via HuggingFace cache):
+  - openai/clip-vit-large-patch14 (CLIP ViT-L/14, 304M, 224x224 input)
+  - openai/clip-vit-base-patch16  (CLIP ViT-B/16,  150M, 224x224 input)
+  Load via:
+    from transformers import CLIPModel
+    model = CLIPModel.from_pretrained('openai/clip-vit-large-patch14')
+    # or: CLIPModel.from_pretrained('openai/clip-vit-base-patch16')
+
+  Multi-GPU runtime: the container exposes 4 GPUs (CUDA_VISIBLE_DEVICES=0,1,2,3).
+  Single-GPU training only uses 1/4 of available compute and is unlikely to fit
+  the time budget — use all 4 GPUs.

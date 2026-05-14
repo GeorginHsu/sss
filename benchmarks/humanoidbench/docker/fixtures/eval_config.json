@@ -1,0 +1,23 @@
+{
+  "benchmark": "humanoid-bench",
+  "robot": "h1hand",
+  "robot_notes": "Unitree H1 (19-dof body) + 2x Shadow Hand (21-dof each). action_space is Box(-1, 1, (61,), float32) for ALL 10 tasks. observation_space is Box(-inf, inf, (D,), float64) where D varies per task because manipulation tasks append object state.",
+  "action_dim": 61,
+  "control_range": [-1.0, 1.0],
+  "tasks": [
+    {"task_id": "h1hand-walk-v0",           "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   700, "info_has_success": false, "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+    {"task_id": "h1hand-stand-v0",          "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   800, "info_has_success": false, "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+    {"task_id": "h1hand-run-v0",            "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   700, "info_has_success": false, "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+    {"task_id": "h1hand-sit_simple-v0",     "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   750, "info_has_success": false, "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+    {"task_id": "h1hand-balance_simple-v0", "obs_dim": 164, "max_episode_steps": 1000, "success_bar":   800, "info_has_success": false, "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+    {"task_id": "h1hand-reach-v0",          "obs_dim": 157, "max_episode_steps": 1000, "success_bar": 12000, "info_has_success": false, "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+    {"task_id": "h1hand-push-v0",           "obs_dim": 163, "max_episode_steps":  500, "success_bar":   700, "info_has_success": true,  "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+    {"task_id": "h1hand-pole-v0",           "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   700, "info_has_success": false, "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+    {"task_id": "h1hand-door-v0",           "obs_dim": 155, "max_episode_steps": 1000, "success_bar":   600, "info_has_success": false, "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]},
+    {"task_id": "h1hand-package-v0",        "obs_dim": 173, "max_episode_steps": 1000, "success_bar":  1500, "info_has_success": true,  "episodes": 20, "seeds": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]}
+  ],
+  "total_episodes": 200,
+  "success_definition": "OFFICIAL HumanoidBench protocol: episode_success = (episode_total_reward >= success_bar). Only h1hand-push-v0 and h1hand-package-v0 also expose info['success'] in env.step()'s info dict; for the other 8 tasks, predict.py MUST sum rewards over the episode and threshold against success_bar from this file. Do NOT rely on info.get('success', 0) for non-push/package tasks — it will always be 0 and your success_rate will silently be 0.",
+  "evaluator_protocol": "predict.py reports per-episode 'reward' (== episode_total_reward); the evaluator recomputes success = (reward >= success_bar) for every task using the bars in this file. predict.py MAY also report a per-episode 'success' field; if it disagrees with the recomputation, the evaluator-side recomputation wins.",
+  "deterministic_eval_notes": "seed `k` means env.reset(seed=k). Use deterministic policy actions (e.g. SB3 model.predict(obs, deterministic=True)) — sampling adds 10-20% variance on the same seed and breaks reproducibility."
+}

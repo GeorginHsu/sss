@@ -1,0 +1,30 @@
+name	dimension	metric	higher_is_better	low_score	high_score
+habitat3	robotics	nav_seek_success	TRUE	0	1
+vlabench_manipulation	robotics	success_rate	TRUE	0	1
+humanoidbench	robotics	success_rate	TRUE	0	1
+screenspot_pro	computer vision	grounding_score	TRUE	0	1
+ade20k	computer vision	mIoU	TRUE	0	1
+bigcodebench_codegen	natural language processing	pass_at_1	TRUE	0	1
+aime_math_rl	natural language processing	exact_match	TRUE	0	1
+minigrid	robotics	success_rate	TRUE	0	1
+domainnet_quickdraw	computer vision	accuracy	TRUE	0	1
+cogniplan	robotics	exploration_score	TRUE	0	62
+qlib_stock	natural language processing	ic_mean	TRUE	-1	1
+objaverse_3dgen	computer vision	lpips	FALSE	0	1
+crohme_hmer	computer vision	exprate	TRUE	0	1
+asvspoof2021_la	audio/speech understanding	eer	FALSE	0	1
+cifar100lt	computer vision	balanced_accuracy	TRUE	0	1
+cifar100n	computer vision	accuracy	TRUE	0	1
+climsim_lowres	AI for science	mean_r2	TRUE	-1	1
+etth1_forecasting	AI for science	mse	FALSE	0	2
+flip_aav	AI for science	spearman_rho	TRUE	-1	1
+iwildcam_wilds	AI for science	macro_f1	TRUE	0	1
+wilds_fmow	AI for science	worst_region_accuracy	TRUE	0	1
+metrla_traffic	AI for science	mae_60min	FALSE	0	8
+ogbg_molpcba	AI for science	avg_precision	TRUE	0	1
+qm9	AI for science	mae	FALSE	0	2
+split_cifar100	computer vision	average_accuracy	TRUE	0	1
+terra_incognita	computer vision	balanced_accuracy	TRUE	0	1
+voicebank_demand	audio/speech understanding	pesq	TRUE	-0.5	4.5
+weatherbench_z500t850	AI for science	rmse_z500	FALSE	0	3133
+assist2009_kt	natural language processing	auc_roc	TRUE	0	1

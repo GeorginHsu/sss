@@ -1,0 +1,54 @@
+name: mnist_classification
+domain: Computer Vision
+subdomain: Image Classification
+description: |
+  Build an image classifier for handwritten digits (0-9).
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train.pt: 51,000 images — dict with keys "images" (uint8 tensor, shape [N, 28, 28]) and "labels" (int64 tensor, shape [N])
+    - val.pt:   9,000 images — same format as train.pt (15% of the original 60,000 MNIST training set, split with seed=0)
+  The held-out test set contains 10,000 images (standard MNIST test split).
+
+  Images are raw pixel values 0-255 (uint8). You need to normalize them yourself.
+  Labels are integers 0-9.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: --data_path is a DIRECTORY. Load test data with:
+           test_data = torch.load(os.path.join(args.data_path, 'test.pt'))
+         Use ONLY the "images" key (labels are ground truth, never use them).
+  Output: JSON file with format {"predictions": [7, 2, 1, 0, ...]}
+          One predicted class index (int 0-9) per test sample, in order.
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/mnist_classification/
+test_data_dir: /rab_data/mnist_classification_test/
+docker_image: farbench/farbench:mnist_classification-cu118
+
+# Evaluation
+primary_metric: accuracy
+higher_is_better: true
+evaluator_class: benchmarks.mnist_classification.script.evaluator.MNISTEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.pt containing {'images': uint8 [N,28,28], 'labels': int64 [N]}"
+  output_format: '{"predictions": [7, 2, 1, 0, ...]}'
+
+# Constraints
+compute_type: gpu
+# budget-review 2026-04-20 (hardware: 4x RTX 6000 ~48GB VRAM, 10h per-task cap, prefer 1 GPU):
+# MNIST 60k 28x28 grayscale, any CNN converges in minutes on 1 GPU. Keep 1 GPU / 0.5h.
+max_gpu_count: 1
+total_time_budget_hours: 0.5
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-downloaded pretrained models (no network needed):
+    - torchvision: resnet50 (IMAGENET1K_V2, 25M) — torchvision.models.resnet50(weights='IMAGENET1K_V2')

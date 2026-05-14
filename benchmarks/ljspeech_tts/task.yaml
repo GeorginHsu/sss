@@ -1,0 +1,93 @@
+name: ljspeech_tts
+domain: Audio/Speech
+subdomain: Text-to-Speech Synthesis
+description: |
+  Build a single-speaker text-to-speech synthesis model on LJSpeech-1.1 — given normalized English text, generate a natural-sounding speech waveform at 22,050 Hz. Training data contains 12,500 text-audio pairs from a single female speaker reading public domain non-fiction books. Quality is evaluated using UTMOS (automated neural MOS predictor, scale 1-5, higher is better).
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - wavs/:  12,500 WAV files (22,050 Hz, mono, 16-bit PCM), filenames LJ001-0001.wav ... LJ049-0198.wav
+    - metadata.csv:  pipe-delimited, no header. Columns: id|normalized_text
+      Example: LJ001-0001|Printing, in the only sense with which we are at present concerned, differs from most if not from all the arts and crafts represented in the Exhibition
+    - val_wavs/:  100 validation WAV files (same audio format)
+    - val_metadata.csv:  same format as metadata.csv
+
+  Audio clips range 1.1–10.1 seconds (mean ~6.6s). Text is pre-normalized (numbers and abbreviations are spelled out). The complete dataset has 13,100 utterances total: 12,500 training, 100 validation, 500 test.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains test_texts.txt (one entry per line, format: id|normalized_text, 500 lines).
+  Output: Save synthesized WAV files (22,050 Hz, mono) to a directory, then write a JSON file: {"predictions_dir": "<absolute_path_to_synth_wavs>/"}
+          Each WAV file must be named {id}.wav matching the id from test_texts.txt (e.g., LJ050-0001.wav).
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/ljspeech_tts/
+test_data_dir: /rab_data/ljspeech_tts_test/
+docker_image: farbench/farbench:ljspeech_tts-cu118
+# Evaluation
+primary_metric: utmos
+higher_is_better: true
+evaluator_class: benchmarks.ljspeech_tts.script.evaluator.LJSpeechTTSEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test_texts.txt with lines of format id|normalized_text"
+  output_format: '{"predictions_dir": "/path/to/synth_wavs/"}'
+
+# Constraints
+# budget-review 2026-04-20: LJSpeech TTS (12.5k pairs), FastSpeech2 + HiFi-GAN + BigVGAN pre-cached, fine-tune or direct inference, 1 GPU 6h has headroom. Keep.
+max_gpu_count: 1
+max_cpu_cores: 24
+max_memory_gb: 48
+max_model_params_billion: 1.0
+total_time_budget_hours: 6.0
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): speechbrain, g2p-en, phonemizer, pymcd, openai-whisper, jiwer, bigvganinference
+
+  Metric runtime: UTMOS is pre-cached through the SpeechMOS torch.hub repo
+  (`torch.hub.load(..., 'utmos22_strong')`). There is intentionally no
+  `import utmos` package in the image.
+
+  Pre-downloaded pretrained models (no network needed):
+
+  Acoustic model (text → mel):
+  - SpeechBrain FastSpeech2 LJSpeech (~25M)
+    savedir='/opt/pretrained_models/tts-fastspeech2-ljspeech'
+    Load via: from speechbrain.inference.TTS import FastSpeech2
+
+  Vocoders (mel → waveform):
+  - SpeechBrain HiFi-GAN LJSpeech (~14M)
+    savedir='/opt/pretrained_models/tts-hifigan-ljspeech'
+    Load via: from speechbrain.inference.vocoders import HIFIGAN
+  - BigVGAN v2 22kHz 80-band (NVIDIA, ~112M, weights in HF cache)
+    Load via: bigvganinference.bigvgan.BigVGAN + hf_hub_download('nvidia/bigvgan_v2_22khz_80band_256x')
+
+  G2P (text → ARPAbet phonemes, for FastSpeech2 input):
+  - g2p_en (CMUDict-based, NLTK data pre-downloaded): from g2p_en import G2p
+  - phonemizer (espeak-ng backend): from phonemizer import phonemize
+
+  ASR for intelligibility self-check (optional):
+  - Whisper small.en (244M): import whisper; whisper.load_model('small.en')
+
+  Mel convention (both vocoders compatible): sr=22050, n_fft=1024, hop=256, win=1024, n_mels=80, fmin=0, fmax=8000
+
+  ## Eval throughput
+  predict.py synthesizes 500 test utterances. Load acoustic model, vocoder,
+  G2P/phonemizer, and any checkpoints once, then batch text-to-mel and vocoder
+  calls where the chosen model supports it.
+    - SpeechBrain FastSpeech2 accepts lists of texts; keep text batches around
+      16-64 and tune upward until generation latency stops improving.
+    - Batch vocoder calls by mel length or sort by text length first to reduce
+      padding waste, then restore filenames to the exact ids in test_texts.txt.
+    - Use `with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):`
+      for GPU inference when the model supports it.
+    - Write 22,050 Hz mono WAVs directly; avoid per-file resampling in predict.py.

@@ -1,0 +1,76 @@
+name: split_cifar100
+domain: computer vision
+subdomain: Continual Learning
+description: |
+  Build a continual learning system for class-incremental image classification on CIFAR-100.
+  The 100 classes are split into 10 sequential tasks (10 classes each). You must train
+  on tasks sequentially — train on task 0, then task 1, ..., then task 9 — and finally
+  classify ALL test images across all 100 classes. This is the Class-Incremental Learning
+  (Class-IL) scenario: task identity is NOT provided at test time.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - meta.json: task metadata with fields:
+        "num_tasks": 10
+        "classes_per_task": [[c0,...,c9], [c10,...,c19], ...] (10 lists of 10 class indices)
+        "total_classes": 100
+      The class ordering is a fixed random permutation of 0-99.
+    - task_0/train.pt through task_9/train.pt: per-task training data.
+      Each file is a dict with keys:
+        "images": uint8 tensor [N, 3, 32, 32] (RGB, pixel values 0-255)
+        "labels": int64 tensor [N] (original CIFAR-100 class indices 0-99)
+      Each task has ~4,500 images (10 classes x ~450 images/class).
+    - val.pt: global validation set across ALL 100 classes — same dict format, ~5,000 images.
+      Use this to monitor overall accuracy and detect catastrophic forgetting during sequential training.
+
+  Total: ~45,000 train images across 10 tasks, ~5,000 val images, 10,000 test images.
+  All images are 32x32 RGB. Normalize yourself (CIFAR-100 mean=[0.5071,0.4867,0.4408], std=[0.2675,0.2565,0.2761]).
+  Labels are original CIFAR-100 class indices (0-99), NOT remapped per-task.
+
+  You may use any model architecture and continual learning strategy.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: --data_path is a DIRECTORY. Load test data with:
+           test_data = torch.load(os.path.join(args.data_path, 'test.pt'))
+         Use ONLY the "images" key (labels are ground truth, never use them).
+         The test set contains 10,000 images from ALL 100 classes (100 per class).
+  Output: JSON file with format {"predictions": [42, 7, 91, 0, ...]}
+          One predicted class index (int 0-99) per test sample, in order.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/split_cifar100/
+test_data_dir: /rab_data/split_cifar100_test/
+docker_image: farbench/farbench:split_cifar100-cu118
+
+# Evaluation
+primary_metric: average_accuracy
+higher_is_better: true
+evaluator_class: benchmarks.split_cifar100.script.evaluator.SplitCIFAR100Evaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.pt containing {'images': uint8 [10000,3,32,32], 'labels': int64 [10000]}"
+  output_format: '{"predictions": [42, 7, 91, 0, ...]}'
+
+# Constraints
+# budget-review 2026-04-20: Split-CIFAR100 continual learning (10 sequential tasks), EWC/Replay/LwF, 1 GPU 3h is sufficient. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 5
+max_iterations: 30
+network_access: false
+
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): quadprog, kornia
+
+  Pre-downloaded pretrained models (no network needed):
+    - torchvision: resnet18 (IMAGENET1K_V1, 11.7M) — standard CL backbone
+    - timm: vit_base_patch16_224.augreg_in21k_ft_in1k (86M) — for L2P/DualPrompt/CODA-Prompt
+    - CLIP ViT-B/16 (86M) — timm.create_model('vit_base_patch16_clip_224.openai', pretrained=True)

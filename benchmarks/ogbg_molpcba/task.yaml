@@ -1,0 +1,58 @@
+name: ogbg_molpcba
+domain: AI for science
+subdomain: Molecular Classification
+description: |
+  Build a multi-task binary classification model for 128 bioassay activity predictions on molecular graphs (ogbg-molpcba from Open Graph Benchmark).
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train.pt: dict with keys:
+        "node_features": list of 350,343 tensors, each shape [num_atoms, 9] (int64, 9-dim atom features)
+        "edge_index": list of 350,343 tensors, each shape [2, num_bonds] (int64, COO edge indices)
+        "edge_attr": list of 350,343 tensors, each shape [num_bonds, 3] (int64, 3-dim bond features)
+        "labels": list of 350,343 tensors, each shape [128] (float32, binary labels with NaN for missing)
+    - val.pt: same format, 43,793 graphs
+
+  Each molecule is a graph: nodes are atoms (9 features: atomic number, chirality, degree, formal charge,
+  num Hs, radical electrons, hybridization, aromaticity, ring membership), edges are bonds (3 features:
+  bond type, stereochemistry, is_conjugated). Labels are 128 binary bioassay outcomes (0/1) with NaN
+  for missing values. Only ~1.4% of labeled entries are positive (extreme class imbalance).
+  When computing loss, mask out NaN entries (NaN != NaN trick: is_labeled = y == y).
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains test.pt with keys "node_features", "edge_index", "edge_attr" (no labels).
+  Output: JSON file with format {"predictions": [[0.12, null, 0.87, ...], [0.03, 0.95, null, ...], ...]}
+          One list of 128 float probabilities per molecule, in order. Use null for tasks where prediction
+          is not available (though predicting all 128 is strongly recommended).
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/ogbg_molpcba/
+test_data_dir: /rab_data/ogbg_molpcba_test/
+docker_image: farbench/farbench:ogbg_molpcba-cu118
+
+# Evaluation
+primary_metric: avg_precision
+higher_is_better: true
+evaluator_class: benchmarks.ogbg_molpcba.script.evaluator.OGBGMolpcbaEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.pt containing node_features, edge_index, edge_attr lists (no labels)"
+  output_format: '{"predictions": [[0.12, null, 0.87, ...], ...]}'
+
+# Constraints
+# budget-review 2026-04-20: ogbg-molpcba (~437k molecular graphs, 128 tasks), GIN/GCN from scratch, ~1h/run on 1 GPU × ~4 runs. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 6
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): torch-geometric (with torch-scatter, torch-sparse, torch-cluster, torch-spline-conv), ogb, rdkit

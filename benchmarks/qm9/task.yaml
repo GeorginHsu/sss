@@ -1,0 +1,88 @@
+name: qm9
+domain: AI for science
+subdomain: Molecular Property Prediction
+description: |
+  Build a regression model to predict the HOMO-LUMO gap of small organic molecules.
+  The dataset contains ~130,831 molecules from QM9 (after excluding 3,054 uncharacterized
+  molecules), split 80/10/10 into train (~104,664), val (~13,083), and test (~13,084).
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container). Two formats are provided:
+
+  ### Option A: SMILES (for 2D graph or fingerprint methods)
+    - train.csv: CSV with columns "smiles" (molecular SMILES string) and "target" (HOMO-LUMO gap in eV)
+    - val.csv:   same format
+
+  ### Option B: 3D Coordinates (for geometric deep learning — recommended for best results)
+    - train_3d.pt: PyTorch file, load with torch.load(). Contains a list of molecule dicts:
+        [{"z": tensor([6,1,1,...]),         # atomic numbers (int64, shape [N_atoms])
+          "pos": tensor([[x,y,z],...]),      # DFT-optimized 3D coordinates in Angstrom (float32, shape [N_atoms, 3])
+          "smiles": "C...",                  # canonical SMILES string
+          "target": 6.42}, ...]              # HOMO-LUMO gap in eV (float)
+    - val_3d.pt: same format
+
+  3D coordinates are DFT-optimized geometries (B3LYP/6-31G(2df,p)) from the original QM9 dataset.
+  Molecules contain up to 9 heavy atoms (C, H, O, N, F), with ~18 atoms on average including hydrogens.
+  The target is the HOMO-LUMO gap in eV, ranging approximately 0.7 to 13.7 eV (mean ~6.8 eV).
+
+  State-of-the-art methods use 3D coordinates with equivariant geometric neural networks
+  (SchNet, DimeNet++, PaiNN, Equiformer), achieving MAE ~0.03–0.06 eV.
+  SMILES-only methods are limited to MAE ~0.12–0.14 eV.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains:
+    - test.csv:  column "smiles" only (no target)
+    - test_3d.pt: list of dicts with keys "z", "pos", "smiles" (no target)
+    Use whichever format your model requires.
+  Output: JSON file with format {"predictions": [4.21, 6.78, 3.14, ...]}
+          One predicted HOMO-LUMO gap value (float, in eV) per molecule, in row order.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/qm9/
+test_data_dir: /rab_data/qm9_test/
+docker_image: farbench/farbench:qm9-cu118
+
+# Evaluation
+primary_metric: mae
+higher_is_better: false
+evaluator_class: benchmarks.qm9.script.evaluator.QM9Evaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.csv with column 'smiles'; test_3d.pt with list of {z, pos, smiles} dicts"
+  output_format: '{"predictions": [4.21, 6.78, ...]}'
+
+# Constraints
+# budget-review 2026-04-20: QM9 (134k molecules) property regression, SchNet/DimeNet++/EGNN trained from scratch, 1-2h on 1 GPU. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 2
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): rdkit, torch-geometric, torch-scatter, torch-cluster, torch-sparse, torch-spline-conv, e3nn, torchmd-net, mordredcommunity
+
+  Two data formats are available — use whichever fits your approach:
+    - CSV  (train.csv, val.csv):      SMILES + target — for fingerprint or 2D graph methods
+    - 3D   (train_3d.pt, val_3d.pt):  atomic numbers + DFT coordinates + target — for 3D geometric DL
+
+  Loading 3D data:
+    data = torch.load('/data/train_3d.pt')
+    mol = data[0]  # {'z': tensor, 'pos': tensor, 'smiles': str, 'target': float}
+
+  Converting to PyG Data objects:
+    from torch_geometric.data import Data
+    graphs = [Data(z=m['z'], pos=m['pos'], y=torch.tensor([m['target']])) for m in data]
+
+  Available model libraries (all offline, inspect with help() / dir()):
+    - torch_geometric.nn.models: SchNet, DimeNetPlusPlus
+    - torchmdnet.models:         ET (Equivariant Transformer), PaiNN, TensorNet, GraphNetwork
+    - e3nn:                      SO(3)/SE(3) equivariant tensor ops (球谐、Clebsch-Gordan)
+    - mordred:                   2D molecular descriptors (1600+) for classical ML

@@ -1,0 +1,97 @@
+name: asvspoof2021_la
+domain: audio/speech understanding
+subdomain: Deepfake Detection
+description: |
+  Build an audio deepfake detector for the ASVspoof 2021 Logical Access task — a binary classifier that distinguishes bonafide (genuine) speech from spoofed (TTS/voice-conversion) speech. The key challenge is generalization: models are trained on clean audio but evaluated on speech transmitted through various telephony codecs (a-law, G.722, GSM, OPUS, etc.).
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train/flac/:       25,380 training .flac files from ASVspoof 2019 LA (16 kHz mono, 16-bit, ~1-15s, typical 3-5s)
+    - dev/flac/:         24,844 development .flac files (same audio specs)
+    - train_protocol.txt: 25,380 lines, 5 space-separated columns:
+        col 1 — speaker_id      (e.g. "LA_0079"; 20 unique train speakers)
+        col 2 — utterance_id    (e.g. "LA_T_1138215"; corresponds to file train/flac/<utterance_id>.flac)
+        col 3 — environment_id  (always "-" in LA task, can be ignored)
+        col 4 — attack_type     ("-" for bonafide, "A01"-"A06" for the 6 known TTS/VC attacks)
+        col 5 — label           ("bonafide" or "spoof")
+    - dev_protocol.txt:  24,844 lines, same 5-column format. Dev speakers (20) are disjoint from train.
+
+  Class distribution (heavily imbalanced):
+    train: 2,580 bonafide / 22,800 spoof  (~10% / 90%)
+    dev:   2,548 bonafide / 22,296 spoof  (~10% / 90%)
+
+  Example train_protocol.txt rows:
+    LA_0079 LA_T_1138215 - - bonafide
+    LA_0079 LA_T_1004644 - A01 spoof
+
+  Test set: ~18,000 utterances subsampled from the ASVspoof 2021 LA eval set (codec-degraded
+  audio: a-law / mu-law / G.722 / GSM / OPUS / clean conditions), stratified by (label, attack_id)
+  to preserve both the ~10% bonafide ratio and the 13-attack distribution. Test attacks (A07-A19)
+  do NOT overlap with train/dev attacks (A01-A06), and test speakers are disjoint from train/dev —
+  this is an out-of-domain generalization benchmark across 3 axes: unseen attacks, unseen channels,
+  unseen speakers.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains:
+    - test.txt:  one utterance_id per line (e.g. "LA_E_1000854"); defines the order of predictions.
+    - flac/:     18,000 .flac files named <utterance_id>.flac (16 kHz mono, same format as train).
+    No labels are visible to the agent at test time.
+
+  Output: JSON file with format {"predictions": [1.037, -0.234, 0.567, ...]}
+          One float score per test utterance, in the same order as test.txt.
+          Higher score = more likely bonafide. Scores are unbounded (logits or any monotonic
+          score work — EER is threshold-free).
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/asvspoof2021_la/
+test_data_dir: /rab_data/asvspoof2021_la_test/
+docker_image: farbench/farbench:asvspoof2021_la-cu118
+
+# Evaluation
+primary_metric: eer
+higher_is_better: false
+evaluator_class: benchmarks.asvspoof2021_la.script.evaluator.ASVspoofEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.txt with utterance IDs + flac/ directory with audio files"
+  output_format: '{"predictions": [1.037, -0.234, 0.567, ...]}'
+
+# Constraints
+# budget-review 2026-04-24: target hardware is RTX 5090 32GB / 24-core / 48GB. 8h on 1 GPU
+# allows ~1.5 full XLS-R-300M / WavLM-large fine-tunes (3-5h each) plus prototype runs;
+# 6h was tight for SSL-large with no headroom for hyperparam search. Keep 1 GPU — 25K utts
+# is too small to benefit from DDP and multi-GPU only burns iterations on setup.
+max_gpu_count: 1
+total_time_budget_hours: 8.0
+max_iterations: 30
+network_access: false
+max_cpu_cores: 48
+max_memory_gb: 96
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): speechbrain, pyloudnorm, torchcodec
+
+  Pre-downloaded speech encoders (no network needed):
+    - facebook/wav2vec2-base (95M), facebook/wav2vec2-xls-r-300m (300M), microsoft/wavlm-large (317M)
+    Load via: AutoModel.from_pretrained('facebook/wav2vec2-xls-r-300m')
+
+  ## Eval throughput
+  predict.py runs over ~18K utterances; per-epoch validation hits ~25K.
+  Default `batch_size=16, num_workers=2` leaves a 24-32 GB GPU at <30 % util.
+  Scale to the hardware budget reported above:
+    - batch_size in bf16: XLS-R-300M / WavLM-large 64-128, wav2vec2-base 256+
+      (fp32: halve). OOM is the back-off signal.
+    - num_workers ≈ min(8, max_cpu_cores // 2); FLAC decode + feature-extractor
+      padding are CPU-bound.
+    - bf16 inference is free quality-wise: wrap forward in
+      `with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):`
+    - Length-bucket the dev/test set before batching (utterances span 1-15 s;
+      pad-to-longest on shuffled order wastes 50-70 % of compute).

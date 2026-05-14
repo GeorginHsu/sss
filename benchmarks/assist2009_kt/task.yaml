@@ -1,0 +1,63 @@
+name: assist2009_kt
+domain: natural language processing
+subdomain: Knowledge Tracing
+description: |
+  Knowledge Tracing on ASSISTments 2009: predict whether a student will
+  correctly answer their next question, given their interaction history.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train.pt: dict with keys:
+        "skill_ids": int64 tensor [N, max_seq_len] — skill index per step (0-based)
+        "corrects":  int64 tensor [N, max_seq_len] — 1 if correct, 0 if wrong
+        "lengths":   int64 tensor [N]              — actual sequence length per student
+        "num_skills": int                           — total number of unique skills
+    - val.pt: same format
+
+  Each row is one student's interaction sequence, zero-padded to max_seq_len.
+  At each step t, the student attempts skill skill_ids[t] and gets result corrects[t].
+  The task: given steps 0..t-1, predict corrects[t].
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>
+
+  Input: test_data_dir contains test.pt with same format as train.pt.
+  Output: JSON file with format {"predictions": [0.82, 0.15, 0.67, ...]}
+          A flat list of predicted probabilities (float, 0-1) for each VALID
+          prediction step across ALL sequences.
+
+  Valid prediction steps: for a sequence of length L, there are L-1 predictions
+  (predicting step 1 from step 0, step 2 from steps 0-1, etc.).
+  Targets are corrects[:, 1:] (i.e. shifted by one step).
+  Let T = corrects.shape[1] (the padded sequence length in the .pt file).
+  The mask for valid prediction positions is:
+      mask = torch.arange(T - 1).unsqueeze(0) < (lengths.unsqueeze(1) - 1)
+  Total number of predictions = mask.sum().item().
+  Output predictions in sample order (sequence 0 first, then sequence 1, etc.).
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/assist2009_kt/
+test_data_dir: /rab_data/assist2009_kt_test/
+docker_image: farbench/farbench:assist2009_kt-cu118
+
+# Evaluation
+primary_metric: auc_roc
+higher_is_better: true
+evaluator_class: benchmarks.assist2009_kt.script.evaluator.KTEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.pt containing {'skill_ids': [N,T], 'corrects': [N,T], 'lengths': [N], 'num_skills': int}"
+  output_format: '{"predictions": [0.82, 0.15, ...]}'
+
+# Constraints
+# budget-review 2026-04-20: Knowledge tracing (~4k student sequences), DKT/SAKT/AKT converges in <30 min on 1 GPU. Keep 1 GPU / 0.5h.
+max_gpu_count: 1
+total_time_budget_hours: 0.5
+max_iterations: 30
+network_access: false

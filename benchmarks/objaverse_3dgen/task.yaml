@@ -1,0 +1,110 @@
+name: objaverse_3dgen
+domain: computer vision
+subdomain: 3D Generation
+description: |
+  Single-image 3D generation: given one input view of an object, reconstruct a 3D
+  representation of the object and render it from multiple target camera poses.
+  Evaluation compares rendered images against ground truth using LPIPS, PSNR, and SSIM.
+
+  Data source: Arb-Objaverse (curated Objaverse subset with pre-rendered multi-view images).
+  1000 objects split into 800 train / 100 val / 100 test.
+  Each object has 12 viewpoints with known camera parameters (azimuth, elevation, distance).
+  The agent receives 1 input view and must generate the remaining 11 target views.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - meta.json: metadata with fields:
+        "n_objects_train": 800, "n_objects_val": 100, "n_objects_test": 100,
+        "n_views": 12, "image_size": 256,
+        "source": "arb_objaverse"
+    - train/<object_uid>/
+        input.png        — single input view (view index 0), 256x256 RGBA PNG
+        target_views/
+          view_01.png ... view_11.png   — 11 target views, 256x256 RGBA PNG
+        cameras.json     — camera parameters for all 12 views:
+          [{"view_id": 0, "azimuth": ..., "elevation": ..., "distance": ...}, ...]
+    - val/<object_uid>/   — same structure, 100 objects for validation
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: --data_path is a DIRECTORY containing:
+           <object_uid>/input.png       — single input view per object
+           <object_uid>/cameras.json    — target camera poses
+         For each object, generate 11 novel views matching the target camera poses.
+  Output: Two things:
+    1. A directory of rendered images saved next to the output JSON.
+       Directory name = output filename (without .json) + "_renders/".
+       Example: if --output is /results/eval_predictions.json,
+       save renders to /results/eval_predictions_renders/<object_uid>/view_01.png, ..., view_11.png
+       Each PNG is an RGBA uint8 image at 256x256 resolution.
+    2. The JSON file at --output with format: {"predictions_dir": "/results/eval_predictions_renders/"}
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/objaverse_3dgen/
+test_data_dir: /rab_data/objaverse_3dgen_test/
+docker_image: farbench/farbench:objaverse_3dgen-cu118
+
+# Evaluation
+primary_metric: lpips
+higher_is_better: false
+evaluator_class: benchmarks.objaverse_3dgen.script.evaluator.Objaverse3DGenEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "<object_uid>/input.png + cameras.json — 100 test objects, 1 input view each"
+  output_format: '{"predictions_dir": "<path>_renders/"} + rendered PNG images in that dir'
+
+# Constraints
+# budget-review 2026-04-20: Objaverse single-image 3D generation (1000 objects × 12 views, 256x256), neural rendering / multi-view diffusion is memory-heavy.
+# 2 GPUs is reasonable (48GB×2 fits most lightweight NVS architectures); per-scene NeRF could work on 1 GPU. Keep 2 GPUs / 8h.
+max_gpu_count: 2
+total_time_budget_hours: 8
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): lpips, kornia, scikit-image,
+    transformers, diffusers, accelerate, einops, omegaconf, trimesh, tsr
+
+  Pre-cached models (no network needed):
+    - VGG-16 for LPIPS (~60MB) — lpips.LPIPS(net='vgg') auto-cached
+    - ResNet-50 (~98MB) — torchvision.models.resnet50(weights='IMAGENET1K_V1')
+    - DINO ViT-B/16 config (~1KB) — used internally by TripoSR's image tokenizer
+
+  Pre-downloaded pretrained model weights (at /models/, load by local path):
+    - TripoSR (~520MB) — single-image → 3D triplane → render at any camera pose
+        import sys; sys.path.insert(0, '/opt/triposr')
+        from tsr.system import TSR
+        model = TSR.from_pretrained(
+            "/models/triposr",
+            config_name="config.yaml",
+            weight_name="model.ckpt",
+        )
+        model.renderer.set_chunk_size(131072)
+        model.to(device)
+        # inference: scene_codes = model([pil_image], device=device)
+        # render:    frames = model.render(scene_codes, n_views=11, return_type="pil")
+        Note: TripoSR is installed at /opt/triposr (add to sys.path before import).
+        Note: input images MUST be RGB. Convert RGBA inputs with img.convert("RGB")
+        before passing to the model, otherwise the image tokenizer will fail.
+
+  CRITICAL RULES:
+  - You MUST add sys.path.insert(0, '/opt/triposr') BEFORE importing tsr in ANY
+    script. The tsr package is installed at /opt/triposr, not as a pip package.
+  - Do NOT run broad file scans (find, ls -R) to explore the TripoSR source code.
+    ALL necessary API information is documented above.
+  - If you see repeated errors, STOP and fix immediately — do not retry blindly.
+
+  Primary metric: LPIPS (lower is better). Also reported: PSNR (higher), SSIM (higher).
+
+  Camera parameters vary per object (azimuth/elevation/distance from cameras.json).
+  View 0 is the input; views 1–11 are the targets at the given camera poses.
+
+  Environment: headless GPU server (no display). Use PyTorch-based rendering
+  (e.g. TripoSR's built-in renderer) instead of OpenGL-based renderers.

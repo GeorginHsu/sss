@@ -1,0 +1,52 @@
+name: weatherbench_z500t850
+domain: AI for science
+subdomain: Weather Forecasting
+description: |
+  Build a global weather forecasting model on WeatherBench (5.625deg, 32x64 lat-lon grid) to predict Z500 (geopotential at 500 hPa) and T850 (temperature at 850 hPa) fields 72 hours (3 days) ahead from 3 consecutive 6-hourly input snapshots.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train_data.npy: float32 [54056, 2, 32, 64] — 6-hourly snapshots from 1979-2015 (37 years). Channel 0 = Z500 (geopotential, m^2/s^2, range ~49000-58000). Channel 1 = T850 (temperature, K, range ~230-310).
+    - val_data.npy: float32 [1464, 2, 32, 64] — 6-hourly snapshots from 2016 (1 leap year).
+    - lat.npy: float64 [32] — latitude values from ~87.2 deg N to ~87.2 deg S (descending).
+    - lon.npy: float64 [64] — longitude values from 0 deg to ~354.4 deg E (ascending, 5.625 deg spacing).
+    - norm_stats.json: {"z500_mean": float, "z500_std": float, "t850_mean": float, "t850_std": float} — global mean/std from training set for each variable.
+
+  The 32x64 grid covers the entire globe at 5.625 deg equirectangular resolution. Longitude is periodic (wraps around at 0/360 deg). Grid cells near the equator cover more area than those near the poles — the evaluation metric accounts for this via latitude weighting. To create training pairs: use sliding windows of 3 consecutive timesteps as input [3, 2, 32, 64] and the snapshot 12 steps (72h) later as target [2, 32, 64].
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains test_inputs.npy — float32 [2906, 3, 2, 32, 64]. 2906 input windows, each with 3 consecutive 6-hourly snapshots (t-12h, t-6h, t), 2 channels (Z500, T850), 32x64 grid. Values are raw (not normalized). Also available: norm_stats.json (same as training dir) and lat.npy for reference.
+  Output: Two things:
+    1. Save predictions as a numpy file at <output_stem>_predictions.npy (where <output_stem> is the --output path without .json extension), shape [2906, 2, 32, 64], float32. Channel 0 = predicted Z500 (m^2/s^2), Channel 1 = predicted T850 (K). Values must be in original (raw) units.
+    2. Write the JSON file at --output path: {"predictions_file": "<absolute_path_to_npy>"}
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/weatherbench_z500t850/
+test_data_dir: /rab_data/weatherbench_z500t850_test/
+docker_image: farbench/farbench:weatherbench_z500t850-cu118
+
+# Evaluation
+primary_metric: rmse_z500
+higher_is_better: false
+evaluator_class: benchmarks.weatherbench_z500t850.script.evaluator.WeatherBenchEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test_inputs.npy — float32 [2906, 3, 2, 32, 64] input windows (raw values)"
+  output_format: '{"predictions_file": "<path_to_predictions.npy>"} where .npy has shape [2906, 2, 32, 64]'
+
+# Constraints
+compute_type: gpu
+# budget-review 2026-04-20: WeatherBench z500+t850 low-res forecasting, ResNet/Transformer on 1 GPU 2h; bump to 4h if agent explores larger models.
+max_gpu_count: 1
+total_time_budget_hours: 5
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): xarray, netCDF4, torch-harmonics, neuraloperator

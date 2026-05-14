@@ -1,0 +1,59 @@
+name: terra_incognita
+domain: computer vision
+subdomain: OOD Classification
+description: |
+  Build a wildlife image classifier that generalizes from 3 camera trap locations (L38, L43, L46) to a held-out location (L100). This is a domain generalization task: backgrounds, lighting, and species distributions differ drastically across locations. Evaluated by balanced accuracy (per-class recall macro-average) — the test set is heavily class-imbalanced, so correctly classifying rare species matters as much as common ones.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train.txt: 15,914 lines of "relative_path label" (e.g., "location_38/bird/00001.jpg 0")
+    - val.txt:   3,991 lines, same format (stratified 80/20 split from source domains)
+    - images/:   JPEG image files organized by location/class subdirectories
+    - class_names.txt: 10 class names, one per line (line index = class index)
+    - domain_labels.txt: per-sample domain ID matching train.txt line order (0=L38, 1=L43, 2=L46)
+
+  10 classes (alphabetical, index 0-9): bird, bobcat, cat, coyote, dog, empty, opossum, rabbit, raccoon, squirrel. Class distribution is highly imbalanced and differs across domains. Images are variable-size JPEG (~300-600px), recommend resizing to 224x224. Domain labels enable domain-aware methods (CORAL, DANN, etc.) but are optional.
+
+  Test set: 4,879 images from L100. Class distribution is very skewed (raccoon ~52%, opossum ~20%, 6 classes each <5%).
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains test.txt with lines of "relative_path" only (no labels) and images/ directory.
+  Output: JSON file with format {"predictions": [3, 0, 9, 5, ...]}
+          One predicted class index (int 0-9) per test sample, in order.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/terra_incognita/
+test_data_dir: /rab_data/terra_incognita_test/
+docker_image: farbench/farbench:terra_incognita-cu118
+
+# Evaluation
+primary_metric: balanced_accuracy
+higher_is_better: true
+evaluator_class: benchmarks.terra_incognita.script.evaluator.TerraIncognitaEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.txt with lines of 'relative_path' + images/ directory (no labels)"
+  output_format: '{"predictions": [3, 0, 9, 5, ...]}'
+
+# Constraints
+# budget-review 2026-04-20: Terra Incognita (~24k images) domain generalization, CLIP/DINOv2 ViT-B fine-tune <2h on 1 GPU. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 3
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): jsonlines
+
+  Pre-downloaded pretrained models (no network needed):
+    - CLIP ViT-B/16 (86M) — via timm: timm.create_model('vit_base_patch16_clip_224.openai', pretrained=True)
+    - DINOv2 ViT-B/14 (86M) — via transformers: AutoModel.from_pretrained('facebook/dinov2-base')
+    - torchvision: resnet50 (IMAGENET1K_V2, 25M) — torchvision.models.resnet50(weights='IMAGENET1K_V2')

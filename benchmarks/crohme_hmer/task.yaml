@@ -1,0 +1,93 @@
+name: crohme_hmer
+domain: computer vision
+subdomain: Optical Character Recognition
+description: |
+  Handwritten Mathematical Expression Recognition on CROHME 2019: given a
+  grayscale image of a handwritten mathematical expression, output the
+  corresponding LaTeX token sequence.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - meta.json: metadata with fields:
+        "n_train": 9993
+        "n_val": 986      (CROHME 2014 test — the literature-standard val set)
+        "n_test": 1199
+        "vocab_size": number of unique LaTeX tokens (~134)
+        "max_img_h": max image height across all rendered expressions
+        "max_img_w": max image width across all rendered expressions
+    - vocab.txt: one LaTeX token per line; line i (0-based) is token id i.
+        Reserved tokens: <pad>=0, <sos>=1, <eos>=2, <unk>=3.
+    - train/images/<id>.png: grayscale (mode='L') PNG of the handwritten expression,
+        black strokes on white background, variable size (typically 40-400 px tall,
+        60-1200 px wide).
+    - train/labels.txt: one line per training sample, tab-separated:
+        "<id>\t<space-separated LaTeX tokens>"
+        Example: "train_0001\t\\frac { 1 } { 2 } = 0 . 5"
+    - val/images/<id>.png and val/labels.txt: same format. val = CROHME 2014
+        test set (the literature-standard validation set used by CoMER, CAN,
+        BTTR, PosFormer). It is shipped inside the official training archive.
+
+  The LaTeX tokens are already pre-tokenized (whitespace-separated symbols)
+  and canonicalized with the CoMER/CAN community's convention:
+    - \mathrm{sin|cos|tan|log|lim|max|det|...} has been rewritten to \sin|\cos|...
+    - Redundant single-leaf-token braces have been stripped: {C} → C, {\sum} → \sum,
+      but multi-token braces like {2n} stay braced. So for example
+      `C={\\sum }_{n=1}{c}_{n}{n}^{2}` becomes
+      `C = \\sum _ { n = 1 } c _ n n ^ 2`.
+  A token is either a single character (digits, letters, =, +, -, etc.) or a
+  LaTeX command (\frac, \sum, \sqrt, \alpha, etc.) or a grouping brace ({ or }).
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>
+
+  Input: --data_path is a DIRECTORY containing:
+           images/<id>.png — 1199 grayscale test images (no labels visible)
+           meta.json, vocab.txt — same as training (for consistent vocabulary)
+  Output: JSON file with format:
+    {"predictions": [
+        {"id": "test_0001", "latex": "\\frac { 1 } { 2 }"},
+        {"id": "test_0002", "latex": "a + b = c"},
+        ...
+    ]}
+  The predictions list length must equal the number of test images. Each
+  entry's "latex" is a LaTeX string. The evaluator applies the same
+  canonicalization as on ground-truth labels (see description above), so
+  equivalent styles like `\\frac{1}{2}`, `\\frac { 1 } { 2 }`, and `\\frac 1 2`
+  all compare equal. The only requirement is that LaTeX commands and the
+  following argument be lexically separated (e.g., write `\\sin x`, not
+  `\\sinx`, because the latter parses as one undefined command). Order within
+  the list does not matter — entries are matched by "id".
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/crohme_hmer/
+test_data_dir: /rab_data/crohme_hmer_test/
+docker_image: farbench/farbench:crohme_hmer-cu118
+
+# Evaluation
+primary_metric: exprate
+higher_is_better: true
+evaluator_class: benchmarks.crohme_hmer.script.evaluator.CROHMEHMEREvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "images/<id>.png (1199 grayscale PNGs) + meta.json + vocab.txt"
+  output_format: '{"predictions": [{"id": "test_0001", "latex": "\\frac { 1 } { 2 }"}, ...]}'
+
+# Constraints
+# budget-review 2026-04-20: CROHME handwritten math expression recognition, Seq2Seq-Attention encoder-decoder from scratch, 1 GPU 6h fits 1 full run + 1 tuning run. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 6
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): pytorch-lightning, python-Levenshtein
+
+  Pre-downloaded pretrained models (no network needed):
+    - DenseNet-121 (8M, ImageNet) — torchvision.models.densenet121(weights='IMAGENET1K_V1')
+    - ResNet-50 (25M, ImageNet) — torchvision.models.resnet50(weights='IMAGENET1K_V2')

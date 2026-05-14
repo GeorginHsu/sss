@@ -1,0 +1,117 @@
+name: ade20k
+domain: computer vision
+subdomain: Semantic Segmentation
+description: |
+  Build a semantic segmentation model for scene parsing on ADE20K. Given an RGB image
+  of an indoor or outdoor scene, predict a per-pixel semantic label from 150 categories
+  (wall, floor, sky, person, car, chair, tree, etc.). The 150 classes mix "stuff"
+  (wall, sky, floor, road) and "things" (person, car, chair) and are highly imbalanced
+  — a handful of classes dominate the pixel count while long-tail classes appear in
+  only a small fraction of training images.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - meta.json: JSON metadata with fields
+        "num_classes": 150
+        "ignore_index": 255                    (label value to ignore in loss and mIoU)
+        "class_names": list of 150 strings     ("wall", "building", "sky", "floor", ...,
+                                                "flag"); class_names[i] is the name of
+                                                the 0-indexed class i
+        "mean":       [0.485, 0.456, 0.406]    (RGB channel means)
+        "std":        [0.229, 0.224, 0.225]    (RGB channel stds)
+        "crop_size":  512
+    - images/training/: 20,210 RGB JPEG files, 8-bit per channel.
+        Filenames: ADE_train_00000001.jpg ... ADE_train_00020210.jpg (zero-padded 8 digits).
+        Resolution varies per image: shorter side typically 300-800 px, longer side up to
+        ~2500 px; aspect ratios span roughly 0.5-2.0. Images are NOT pre-resized, so any
+        dataloader must handle variable H×W.
+    - annotations/training/: 20,210 single-channel uint8 PNG masks.
+        Filenames match the corresponding image (ADE_train_*.png); each mask's H×W
+        matches its image's H×W exactly. Pixel value semantics in the raw files:
+            0          = unlabeled pixel (exclude from loss and mIoU)
+            1 ... 150  = class indices (1=wall, 2=building, 3=sky, ..., 150=flag)
+        The raw labels are 1-indexed. To align with a 0-indexed 150-way classifier,
+        subtract 1 from every label and remap the original 0 pixels to ignore_index (255).
+        Equivalently: raw pixel value k (for k in 1..150) corresponds to class_names[k-1].
+    - images/validation/:      2,000 RGB JPEG files (same resolution distribution as train).
+    - annotations/validation/: 2,000 uint8 PNG masks (same encoding as train).
+        This is the official MIT Scene Parsing Benchmark val split and is the
+        community-standard evaluation set (Papers With Code, MMSegmentation leaderboard).
+        Labels here are visible to the agent — you may use them for model selection,
+        early stopping, or hyperparameter tuning. The evaluator scores on the same split.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: --data_path is $FARBENCH_TEST_DATA_DIR. It contains meta.json and
+         images/validation/*.jpg — 2,000 JPEG images at their ORIGINAL resolution.
+         Ground-truth masks are stored separately under labels/ for the evaluator.
+         Predict one semantic mask per image, ALSO at the image's original H×W
+         (do NOT output a fixed-size mask; the evaluator compares pixel-for-pixel).
+  Output: Two artifacts:
+    1. A directory of PNG mask files saved NEXT TO the output JSON file.
+       Directory name = output filename (without ".json") + "_masks/".
+       Example: if --output is /results/eval_predictions.json, save masks to
+       /results/eval_predictions_masks/ADE_val_00000001.png, ADE_val_00000002.png, ...
+       (one .png per input image, filename stem matching the image's stem).
+       Each PNG is a single-channel uint8 image whose pixel values are class indices
+       0..149 — i.e., already 0-indexed; do NOT shift back to 1..150.
+    2. The JSON file at --output with content:
+         {"predictions_dir": "<absolute_path_to_mask_directory>/"}
+       pointing to that mask directory.
+    This two-step format avoids storing huge pixel arrays inside JSON.
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/ade20k/
+test_data_dir: /rab_data/ade20k_test/
+docker_image: farbench/farbench:ade20k-cu118
+
+# Evaluation
+primary_metric: mIoU
+higher_is_better: true
+evaluator_class: benchmarks.ade20k.script.evaluator.ADE20KEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "meta.json + images/validation/*.jpg — 2,000 JPEG images at original resolution; labels stored separately under labels/"
+  output_format: '{"predictions_dir": "<path_to_masks_dir>/"} + PNG masks in that dir'
+
+# Constraints
+compute_type: gpu
+# budget-review 2026-05-01: ADE20K semantic segmentation (20k train, 512-896 crops).
+# The image pre-caches 81M-305M backbones that recent ADE20K work commonly uses
+# (SegFormer-B5, Swin-L/Mask2Former, ConvNeXt-L, BEiTv2-L, EVA-02-L, DINOv2-L).
+# These make 4 GPUs appropriate without giving agents 8-GPU SOTA-scale compute.
+# 10h allows several debug/short runs or one heavier fine-tune attempt.
+max_gpu_count: 4
+max_cpu_cores: 48
+max_memory_gb: 96
+max_model_params_billion: 1.0
+total_time_budget_hours: 10
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): mmsegmentation (mmcv, mmengine), ftfy, regex
+
+  Pre-downloaded segmentation backbones (no network needed):
+    - timm: swin_large_patch4_window12_384.ms_in22k_ft_in1k (197M), convnext_large.fb_in22k_ft_in1k (198M)
+    - timm: beitv2_large_patch16_224.in1k_ft_in22k_in1k (304M), eva02_large_patch14_448.mim_m38m_ft_in22k_in1k (305M)
+    - transformers: nvidia/mit-b5 (81M) — AutoModel.from_pretrained('nvidia/mit-b5')
+    - transformers: facebook/dinov2-large (304M) — AutoModel.from_pretrained('facebook/dinov2-large')
+    - torchvision: resnet50 (IMAGENET1K_V2, 25M) — torchvision.models.resnet50(weights='IMAGENET1K_V2')
+
+  ## Resource allocation and eval throughput
+  The container exposes 4 GPUs (CUDA_VISIBLE_DEVICES=0,1,2,3), 48 CPU cores,
+  and 96 GB RAM. Use all 4 GPUs for both training and predict.py evaluation;
+  single-GPU inference over 2,000 original-resolution validation images is a
+  common source of wasted wall-clock time.
+    - Batch validation images by similar resized/original shape when possible;
+      avoid processing one image at a time unless debugging.
+    - For DataLoader workers, keep total workers across all GPU processes within
+      the 48-core budget (4-8 workers per GPU process is usually safe).
+    - Mixed-precision inference is appropriate; final PNG masks must still be
+      single-channel uint8 class indices 0..149 at each image's original HxW.

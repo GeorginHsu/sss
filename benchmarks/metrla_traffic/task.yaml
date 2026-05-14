@@ -1,0 +1,55 @@
+name: metrla_traffic
+domain: AI for science
+subdomain: Traffic Forecasting
+description: |
+  Build a spatiotemporal graph model to predict traffic speeds on 207 Los Angeles highway sensors. Given the past 12 timesteps (1 hour at 5-min intervals), predict the next 12 timesteps (1 hour) for all 207 sensors.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train.npy: float32 array [23,990, 207] — 23,990 consecutive 5-minute traffic speed readings (mph) for 207 sensors (~83 days)
+    - val.npy: float32 array [3,427, 207] — 3,427 consecutive timesteps (~12 days)
+    - adj_mx.npy: float32 array [207, 207] — weighted adjacency matrix (Gaussian kernel on road-network distances, threshold=0.1)
+
+  Speed values are in miles per hour (raw, not normalized). Missing values have been linearly interpolated.
+  The adjacency matrix encodes spatial proximity: W_ij = exp(-d^2/sigma^2) if above threshold, else 0.
+  To create training samples, use a sliding window: input_len=12, pred_len=12, stride=1. From T consecutive timesteps, extract (T - 23) pairs of (x[t:t+12], y[t+12:t+24]).
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains:
+    - test_x.npy: float32 [6,832, 12, 207] — 6,832 test input windows (12 steps × 207 sensors)
+    - adj_mx.npy: float32 [207, 207] — same adjacency matrix as training
+  Output: Two things:
+    1. Save predictions as predictions.npy (float32 [6832, 12, 207]) in a directory next to the output JSON
+    2. Write JSON: {"predictions_dir": "<absolute_path_to_directory>/"}
+    Predictions must be in raw mph scale (not normalized).
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/metrla_traffic/
+test_data_dir: /rab_data/metrla_traffic_test/
+docker_image: farbench/farbench:metrla_traffic-cu118
+
+# Evaluation
+primary_metric: mae_60min
+higher_is_better: false
+evaluator_class: benchmarks.metrla_traffic.script.evaluator.METRLAEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test_x.npy float32 [6832, 12, 207], adj_mx.npy float32 [207, 207]"
+  output_format: '{"predictions_dir": "<path>/"} containing predictions.npy float32 [6832, 12, 207]'
+
+# Constraints
+compute_type: gpu
+# budget-review 2026-04-20: METR-LA spatiotemporal graph forecasting, DCRNN/GraphWaveNet/STGCN, <1h/run on 1 GPU, 3h allows multiple runs. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 3
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): torch-geometric (with torch-scatter, torch-sparse, torch-cluster), networkx, gdown, tables

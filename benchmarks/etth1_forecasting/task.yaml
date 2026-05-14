@@ -1,0 +1,54 @@
+name: etth1_forecasting
+domain: AI for science
+subdomain: Time-Series Forecasting
+description: |
+  Build a multivariate time series forecasting model on ETTh1 (Electricity Transformer Temperature, hourly) to predict all 7 features 720 steps ahead from a 96-step lookback window.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train.csv: CSV with 7 columns (HUFL, HULL, MUFL, MULL, LUFL, LULL, OT), 8640 rows (12 months hourly)
+    - val.csv:   same format, 2880 rows (4 months hourly)
+
+  Each row is one hourly observation. The 7 feature columns in order are: HUFL, HULL, MUFL, MULL, LUFL, LULL, OT. The first 6 are power-load features (High/Medium/Low-UseFul/UseLess) and OT is oil temperature. All values are floats in their original scale.
+
+  Standard split borders: [0, 8640, 11520, 14400] (12/4/4 months). The test region spans rows [11424, 14400) (2976 rows, including 96-step lookback before the test border). Test windows are created with seq_len=96, pred_len=720, stride=1, yielding 2161 windows.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains test_windows.npy — float32 array of shape [2161, 96, 7], 2161 input windows each with 96 timesteps and 7 features, in column order (HUFL, HULL, MUFL, MULL, LUFL, LULL, OT). Values are raw (not normalized).
+  Output: JSON file with format {"predictions": [[[0.12, ...], ...], ...]}
+          A nested list of shape [2161, 720, 7]: for each of the 2161 input windows, predict the next 720 timesteps for all 7 features. Values must be in the original (raw, not normalized) scale.
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/etth1_forecasting/
+test_data_dir: /rab_data/etth1_forecasting_test/
+docker_image: farbench/farbench:etth1_forecasting-cu118
+
+# Evaluation
+primary_metric: mse
+higher_is_better: false
+evaluator_class: benchmarks.etth1_forecasting.script.evaluator.ETTh1Evaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test_windows.npy — float32 [2161, 96, 7] input windows (raw values)"
+  output_format: '{"predictions": [[[0.12, 0.34, ...7 feats], ...720 steps], ...2161 windows]}'
+
+# Constraints
+compute_type: gpu
+# budget-review 2026-04-20: ETTh1 uni/multivariate forecasting, small PatchTST/iTransformer, finishes in minutes on 1 GPU. Keep 1h (covers HP sweeps).
+max_gpu_count: 1
+total_time_budget_hours: 1
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): statsmodels, reformer-pytorch, local-attention, sympy, chronos-forecasting
+
+  Pre-downloaded time series foundation models (no network needed):
+    - Chronos-Bolt-Small (48M) — ChronosBoltPipeline.from_pretrained('amazon/chronos-bolt-small')
+    - Chronos-T5-Small (46M) — ChronosPipeline.from_pretrained('amazon/chronos-t5-small')

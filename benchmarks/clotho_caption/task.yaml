@@ -1,0 +1,95 @@
+name: clotho_caption
+domain: Audio/Speech
+subdomain: Automated Audio Captioning
+description: |
+  Build an automated audio captioning model on Clotho v2 — given an environmental audio clip (15-30 seconds), generate a natural language description of the acoustic scene. Training data contains 3,839 audio clips from Freesound, each with 5 human-written reference captions. Quality is evaluated using SPIDEr = (CIDEr-D + SPICE) / 2; SPIDEr-FL and FENSE are reported as secondary DCASE comparison metrics.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - audio/:  3,839 WAV files (44,100 Hz, mono, 16-bit), duration 15-30 seconds
+      Filenames are descriptive Freesound IDs, e.g., "Acrobatic_Circus_48000.wav"
+    - captions.csv:  comma-delimited CSV with header. Columns: file_name,caption_1,caption_2,caption_3,caption_4,caption_5
+      Captions may contain commas and are properly quoted. Each clip has 5 reference captions (8-20 words, lowercase English).
+    - val_audio/:  1,045 validation WAV files (same format)
+    - val_captions.csv:  same format, 1,045 entries
+
+  Captions describe environmental sounds, actions, and acoustic scenes (e.g., "a dog barks while rain falls in the background"). The full dataset contains 6,929 audio clips; 3,839 for training, 1,045 for validation, 1,045 for test.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains audio/ directory with 1,045 test WAV files (44,100 Hz, mono) and test_files.txt (one filename per line, defines evaluation order).
+  Output: JSON file with format {"predictions": ["a dog barking in the background", "birds singing near a river", ...]}
+          One predicted caption (string) per audio file, in the order specified by test_files.txt.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/clotho_caption/
+test_data_dir: /rab_data/clotho_caption_test/
+docker_image: farbench/farbench:clotho_caption-cu118
+
+# Evaluation
+primary_metric: spider
+higher_is_better: true
+evaluator_class: benchmarks.clotho_caption.script.evaluator.ClothoCaptionEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "audio/ directory with .wav files + test_files.txt listing filenames"
+  output_format: '{"predictions": ["caption1", "caption2", ...]}'
+
+# Constraints
+# budget-review 2026-04-20: Clotho v2 audio captioning (3.8k clips), CLAP + BART/PANNs pre-cached, encoder-decoder fine-tune 4-6h on 1 GPU. Keep.
+max_gpu_count: 1
+max_cpu_cores: 24
+max_memory_gb: 48
+max_model_params_billion: 1.0
+total_time_budget_hours: 6.0
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): aac-metrics, py7zr, sentence-transformers, panns-inference, torchlibrosa
+
+  Pre-downloaded pretrained models (no network needed, all in default HF cache unless noted):
+
+  Audio encoders (for extracting acoustic features):
+  - PANNs CNN14 AudioSet encoder (80M params)
+    Default path: /root/panns_data/Cnn14_mAP=0.431.pth
+    Symlink path: /opt/pretrained_models/Cnn14_mAP_0.431.pth
+    Load via: from panns_inference import AudioTagging
+              AudioTagging(checkpoint_path=None, device='cuda')
+  - mispeech/ced-base (85M params, self-supervised AudioSet encoder, 50% mAP)
+    Load via: from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+              AutoModelForAudioClassification.from_pretrained('mispeech/ced-base', trust_remote_code=True)
+    (AutoModel does NOT work for CED — its remote code only exposes the CedForAudioClassification class)
+
+  Audio-text joint model (encoder + reranker):
+  - laion/clap-htsat-unfused (193M params, contrastive audio-text embedding)
+    Load via: from transformers import ClapModel, ClapProcessor
+              ClapModel.from_pretrained('laion/clap-htsat-unfused')
+
+  Text decoder:
+  - facebook/bart-base (139M params)
+    Load via: from transformers import BartForConditionalGeneration, BartTokenizer
+              BartForConditionalGeneration.from_pretrained('facebook/bart-base')
+
+  ## Eval throughput
+  predict.py runs over 1,045 clips of 15-30 s audio, and caption generation can
+  dominate wall-clock time if done one file at a time. Load the checkpoint and
+  pretrained components once, then batch audio preprocessing / encoder forward /
+  decoder generation where your model allows it.
+    - Start with batch_size 16-32 for CLAP/CED/BART-style pipelines on the
+      1-GPU budget; increase until GPU memory or generation latency stops
+      improving. If using fp32, use smaller batches.
+    - Use `with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):`
+      for GPU inference when the model supports it.
+    - Use DataLoader workers for WAV decode/log-mel feature extraction
+      (num_workers 4-8 is usually safe under the 24-core CPU budget).
+    - Length-bucket or sort test clips by duration before batching to reduce
+      padding waste, but restore predictions to the exact test_files.txt order
+      before writing {"predictions": [...]}.

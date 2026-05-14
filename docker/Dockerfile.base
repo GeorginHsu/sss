@@ -1,0 +1,84 @@
+# farbench/farbench:base-cuNNN — Base image for FARBench tasks.
+# Task images use: ARG BASE_TAG=cu118; FROM farbench/farbench:base-${BASE_TAG}
+#
+# Build cu118: docker build -t farbench/farbench:base-cu118 -f docker/Dockerfile.base .
+# Build cu128: docker build -t farbench/farbench:base-cu128 -f docker/Dockerfile.base \
+#              --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu22.04 \
+#              --build-arg CUDA_TAG=cu128 .
+# Task-specific images are distributed separately as Hugging Face dataset archives.
+
+ARG BASE_IMAGE=nvidia/cuda:11.8.0-runtime-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+ARG CUDA_TAG=cu118
+
+# System dependencies + Docker CLI (for DooD task container management)
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
+    wget \
+    python3 \
+    python3-pip \
+    python3-dev \
+    libgl1-mesa-glx libglib2.0-0 \
+    libsndfile1 ffmpeg \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI — talks to the host daemon via the mounted socket (/var/run/docker.sock)
+COPY --from=docker:24-cli /usr/local/bin/docker /usr/local/bin/docker
+
+# Common ML dependencies (shared by most tasks)
+# Group 1: PyTorch ecosystem (torch, torchvision, torchaudio)
+RUN pip install --no-cache-dir \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/${CUDA_TAG}
+
+# Group 2: Core scientific computing & data handling
+RUN pip install --no-cache-dir \
+    numpy scipy pandas pyyaml pillow nvidia-ml-py \
+    scikit-learn h5py tqdm
+
+# Group 3: Visualization & experiment tracking
+RUN pip install --no-cache-dir \
+    tensorboard matplotlib
+
+# Group 4: NLP / HuggingFace ecosystem
+RUN pip install --no-cache-dir \
+    transformers datasets accelerate evaluate \
+    tokenizers sentencepiece
+
+# Group 5: Computer Vision (used by 6-7 tasks)
+RUN pip install --no-cache-dir \
+    timm torchmetrics einops \
+    albumentations opencv-python-headless
+
+# Group 6: Audio processing (used by all audio tasks)
+RUN pip install --no-cache-dir \
+    librosa soundfile
+
+# Upgrade pip + setuptools so pyproject.toml [project] metadata is read correctly
+# (Ubuntu 22.04 apt ships setuptools ~59.x; we require >=68.0)
+RUN pip install --no-cache-dir --upgrade pip "setuptools>=68.0" wheel
+
+# Install FARBench package
+WORKDIR /opt/farbench
+COPY pyproject.toml .
+COPY farbench/ farbench/
+COPY cli/ cli/
+RUN pip install --no-cache-dir .
+
+# Default working directory for tasks
+WORKDIR /workspace
+
+# Environment variables expected by training scripts
+ENV FARBENCH_TRAINING_LOG_DIR=/workspace/logs \
+    FARBENCH_CHECKPOINT_DIR=/workspace/checkpoints \
+    FARBENCH_DATA_DIR=/workspace/data \
+    FARBENCH_SEED=42
+
+# Clear the NVIDIA base image entrypoint so task containers and the harness
+# can set their own entry command without the nvidia_entrypoint.sh wrapper.
+ENTRYPOINT []
+CMD ["python"]

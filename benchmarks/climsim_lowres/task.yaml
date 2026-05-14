@@ -1,0 +1,69 @@
+name: climsim_lowres
+domain: AI for science
+subdomain: Climate Modeling
+description: |
+  Build a regression model to emulate subgrid-scale atmospheric physics (clouds, convection, radiation, turbulence) from the ClimSim dataset. Given a single atmospheric column state, predict the physical tendencies and fluxes that a high-resolution climate simulation would produce. This is an offline (single-timestep) emulation task on the subsampled low-resolution (11.5°, 384-column) version of the E3SM-MMF climate model output.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train_input.npy: float32 [~10,100,000, 124] — subsampled training inputs (every 7th timestep from years 1-7, all 384 grid columns). Pre-normalized.
+    - train_target.npy: float32 [~10,100,000, 128] — corresponding training targets. Pre-normalized.
+    - val_input.npy: float32 [~1,440,000, 124] — validation inputs (year 8, stride=7). Pre-normalized.
+    - val_target.npy: float32 [~1,440,000, 128] — validation targets. Pre-normalized.
+
+  Input features (124 total, pre-normalized):
+    - state_t: temperature profile (60 vertical levels)
+    - state_q0001: specific humidity profile (60 vertical levels)
+    - state_ps: surface pressure (1 scalar)
+    - pbuf_SOLIN: solar insolation (1 scalar)
+    - pbuf_LHFLX: surface latent heat flux (1 scalar)
+    - pbuf_SHFLX: surface sensible heat flux (1 scalar)
+
+  Output targets (128 total, pre-normalized):
+    - ptend_t: temperature tendency (60 vertical levels)
+    - ptend_q0001: specific humidity tendency (60 vertical levels)
+    - cam_out_NETSW: net shortwave radiation (1 scalar)
+    - cam_out_FLWDS: downward longwave radiation (1 scalar)
+    - cam_out_PRECSC: stratiform precipitation (1 scalar)
+    - cam_out_PRECC: convective precipitation (1 scalar)
+    - cam_out_SOLS, cam_out_SOLL, cam_out_SOLSD, cam_out_SOLLD: solar radiation components (4 scalars)
+
+  All data is pre-normalized (zero mean, unit variance). Train and predict in normalized space. The evaluation computes R² in normalized space, matching the protocol from the NeurIPS 2023 paper (Yu et al., 2023).
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: test_data_dir contains scoring_input.npy — float32 [N_test, 124], pre-normalized test inputs.
+  Output: Two things:
+    1. Save predictions as a numpy file at <output_stem>_predictions.npy (where <output_stem> is the --output path without .json extension), shape [N_test, 128], float32, in normalized space.
+    2. Write the JSON file at --output path: {"predictions_file": "<absolute_path_to_npy>"}
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/climsim_lowres/
+test_data_dir: /rab_data/climsim_lowres_test/
+docker_image: farbench/farbench:climsim_lowres-cu118
+
+# Evaluation
+primary_metric: mean_r2
+higher_is_better: true
+evaluator_class: benchmarks.climsim_lowres.script.evaluator.ClimSimEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "scoring_input.npy — float32 [N_test, 124] pre-normalized atmospheric column states"
+  output_format: '{"predictions_file": "<path_to_predictions.npy>"} where .npy has shape [N_test, 128]'
+
+# Constraints
+# budget-review 2026-04-20: ClimSim low-res climate surrogate regression, mid-size MLP/Transformer, 1 GPU 4h is sufficient. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 4
+max_iterations: 30
+network_access: false
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): xarray, netCDF4

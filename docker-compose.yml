@@ -1,0 +1,56 @@
+# docker-compose.yml — FARBench harness container.
+#
+# scripts/run.sh loads the selected task image from the HF dataset and uses it
+# as the harness image. Task images are already built from the FARBench base.
+# Task training/eval still runs in isolated per-task containers via the host
+# Docker daemon, keeping tasks from polluting each other.
+# FARBENCH_CUDA defaults to cu118 and can be set to cu128 (see .env.example).
+#
+# ── One-time setup ───────────────────────────────────────────────────────────
+#   # The selected task image is downloaded/loaded automatically.
+#
+# ── Run an experiment ────────────────────────────────────────────────────────
+#   bash scripts/run.sh --task mnist_classification --preset claude --gpus 0
+#
+# ── Interactive shell ─────────────────────────────────────────────────────────
+#   FARBENCH_HARNESS_IMAGE=farbench/farbench:mnist_classification-cu118 \
+#     docker compose run --rm --entrypoint bash farbench
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: farbench
+
+services:
+  farbench:
+    image: ${FARBENCH_HARNESS_IMAGE:?FARBENCH_HARNESS_IMAGE must be set by scripts/run.sh}
+    volumes:
+      - .:/workspace                             # project source + experiments/
+      - /var/run/docker.sock:/var/run/docker.sock  # host Docker daemon (task containers)
+    entrypoint: ["python", "-m", "cli.main"]
+    working_dir: /workspace
+    env_file: .env                                 # pass ALL .env variables into container (supports any preset)
+    environment:
+      - PYTHONPATH=/workspace                    # use mounted code — no rebuild needed for .py changes
+      - HOST_WORKSPACE=${PWD}                    # real host path for Docker bind-mounts
+      - FARBENCH_CUDA=${FARBENCH_CUDA:-cu118}              # CUDA variant — used by env.py to rewrite docker image tags
+      - NVIDIA_VISIBLE_DEVICES=${FARBENCH_GPUS:-all}  # NVIDIA runtime respects this to limit GPU visibility
+      # ── Agent presets (from .env) ──────────────────────────
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY:-}
+      - CLAUDE_BASE_URL=${CLAUDE_BASE_URL:-}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-}
+      - GPT4O_API_KEY=${GPT4O_API_KEY:-}
+      - GPT4O_BASE_URL=${GPT4O_BASE_URL:-}
+      - GPT4O_MODEL=${GPT4O_MODEL:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_BASE_URL=${GEMINI_BASE_URL:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-}
+      # ── Search tools (passed through to sandbox containers) ─────────
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all                         # grant GPU access; NVIDIA_VISIBLE_DEVICES limits which ones
+              capabilities: [gpu]

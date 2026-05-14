@@ -1,0 +1,354 @@
+name: bigcodebench_codegen
+domain: natural language processing
+subdomain: Code Generation
+description: |
+  Fine-tune a code-generation model on Nvidia OpenCodeInstruct and evaluate on
+  BigCodeBench-Full (Complete variant) with pass@1.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - train.jsonl: ~195,000 training samples, JSONL format. Each line:
+        {
+          "id": "...",
+          "prompt": "coding problem description (from OpenCodeInstruct `input`)",
+          "completion": "python solution; often wrapped in a ```python ... ``` markdown fence",
+          "source": "nvidia/OpenCodeInstruct",
+          "domain": "generic|algorithmic|...",
+          "average_test_score": 0.0-1.0,        // fraction of unit tests passing (sanity signal)
+          "tests_execution_status": "pass|fail|error|unknown"
+        }
+    - val.jsonl: ~5,000 validation samples, same schema as train.jsonl
+    - dataset_info.json: metadata about the dataset preparation
+
+  NOTE on training data quality:
+    Samples are NOT pre-filtered. You may optionally filter on
+    `average_test_score` (e.g. >= 0.9) or `tests_execution_status == "pass"`
+    to keep only high-quality examples.
+
+  NOTE on completion format:
+    Completions in train/val retain the upstream markdown code fences
+    (```python\\n...\\n```). Two implications:
+      1. During training, the model will learn to emit fenced code.
+      2. Your predict.py MUST strip the fence before writing to
+         predictions.json, otherwise the evaluator feeds ``` into Python
+         and every test case will fail with SyntaxError.
+
+  Test data is at $FARBENCH_TEST_DATA_DIR:
+    - test_prompts.jsonl: 1,140 BigCodeBench-Full problems, each line:
+        {"id": "BigCodeBench/0", "prompt": "...", "starter_code": "...", "entry_point": "task_func"}
+    - test_cases.jsonl: ground-truth unittest test cases (used by evaluator only)
+
+  Each test problem uses an average of 2.8 libraries from 139 available libraries
+  (77 stdlib + 62 third-party). The prompt includes a verbose docstring (~33 lines avg)
+  with interactive examples. The model must generate a complete function body that
+  passes all test cases (~5.6 tests per problem, 99% branch coverage).
+
+  The evaluator runs each problem in a subprocess with a 240s per-problem
+  timeout (matches upstream BigCodeBench), with 16-way thread-pool parallelism
+  and a 25-minute global exec wall-clock deadline. Cases that hit either limit
+  count as failures.  Typical exec wall-clock: ~5-15 minutes on a 32+ core
+  host. Override via env vars BIGCODEBENCH_EVAL_{TIMEOUT_SECONDS,WORKERS,
+  DEADLINE_SECONDS}.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>
+
+  Input: test_data_dir contains test_prompts.jsonl with fields: id, prompt, starter_code, entry_point
+  Output: JSON file with format {"predictions": [{"id": "BigCodeBench/0", "completion": "def task_func(...):\n    ..."}]}
+          One completion per problem, in any order. Each completion must be the raw
+          function body / module-level code — NO markdown fences.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/bigcodebench_codegen/
+test_data_dir: /rab_data/bigcodebench_codegen_test/
+docker_image: farbench/farbench:bigcodebench_codegen-cu118
+
+# Evaluation
+primary_metric: pass_at_1
+higher_is_better: true
+evaluator_class: benchmarks.bigcodebench_codegen.script.evaluator.BigCodeBenchCodegenEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  # predict.py runs under /opt/vllm's interpreter (via the vllm-python wrapper)
+  # so `from vllm import LLM` works out of the box. The framework reads this
+  # `interpreter` field in farbench/eval_harness.py; default would be sys.executable.
+  interpreter: /usr/local/bin/vllm-python
+  invocation: "vllm-python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>"
+  input_format: "test_data_dir contains test_prompts.jsonl with id/prompt/starter_code/entry_point"
+  output_format: '{"predictions": [{"id": "BigCodeBench/0", "completion": "def task_func(...):\n    ..."}]}'
+
+# Constraints
+# budget-review 2026-04-08: Qwen2.5-Coder-3B SFT on OpenCodeInstruct (~195k train) + 1140
+# BigCodeBench eval on 4x RTX 6000 Ada (sm_89, 48 GB/GPU, 192 GB aggregate
+# VRAM). Image variant: cu118 (training stack ships torch 2.7.1+cu118).
+# vLLM lives in an isolated /opt/vllm venv with its own torch+cu128 runtime
+# libs, exposed only via the LD_LIBRARY_PATH wrapper -- this works on any
+# host whose NVIDIA driver supports CUDA 12.x (R535+).
+#
+# Reference timings (1 epoch, seq_len 2048, 200k samples) on 4x 48 GB Ada:
+#   LoRA r=16                 : ~3-4h  train + ~0.5h eval
+#   QLoRA r=32 (4-bit base)   : ~3-5h  train + ~0.5h eval
+#   Full FT + FSDP (bf16)     : ~5-6h  train + ~1h   eval   (48 GB easily fits 3B
+#                                                            in bf16 + AdamW32, no
+#                                                            8-bit optimizer needed)
+#
+# 10h budget fits one full FT epoch OR 2 LoRA epochs with room for debugging
+# and a second training run. Stretch to 20h if the agent needs to try
+# multiple approaches or checkpoint selection.
+max_gpu_count: 4
+per_gpu_memory_gb: 48      # RTX 6000 Ada = 49140 MiB; report 48 GB in agent prompt
+max_cpu_cores: 64          # host has 144 logical cores; 64 per task lets two run in parallel
+max_memory_gb: 256         # host has 1.8 TiB; 256 GB headroom for dataloaders + eval subprocess pool + vLLM
+total_time_budget_hours: 10
+max_iterations: 30
+network_access: false
+max_model_params_billion: 5.0
+
+agent_hints: |
+  ## Pre-installed stack (do NOT reinstall — network is disabled)
+
+  Target hardware: 4x RTX 6000 Ada (sm_89, 48 GB/GPU, 192 GB total VRAM).
+  Container also gets 64 CPU cores and 256 GB RAM, so feel free to raise
+  `dataloader_num_workers`, `BIGCODEBENCH_EVAL_WORKERS`, or vLLM worker
+  counts — RAM is not a constraint. Image variant: cu118. Host NVIDIA
+  driver must support CUDA 12.x (R535+) because the isolated vLLM venv
+  ships its own cu128 runtime libs.
+
+  Training env (default `python`, torch 2.7.1+cu118):
+    - peft==0.13.2           (LoRA, QLoRA, prefix tuning)
+    - trl==0.12.2            (SFTTrainer). Forces transformers down to 4.46.3.
+    - bitsandbytes==0.45.5   (4-bit NF4 for QLoRA, 8-bit AdamW)
+    - accelerate==1.13.0     (from base; drives DDP and FSDP)
+    - transformers==4.46.3   (after trl downgrade)
+    - torch 2.7.1+cu118, safetensors, datasets, numpy, pandas, scipy,
+      scikit-learn, matplotlib and the 40+ libs the BigCodeBench test cases
+      import (requests, cryptography, geopandas, …).
+    NOTE: the upstream `bigcodebench` pip package is NOT installed (it
+    declares vllm as a hard dep, which conflicts with our isolated /opt/vllm
+    setup). The 1,140 test-case runtime libs (numpy, pandas, scipy, sklearn,
+    matplotlib, requests, cryptography, geopandas, ...) are installed
+    explicitly. You do not need to call any bigcodebench CLI.
+  NOT installed (considered but dropped):
+    - deepspeed — base image is `-runtime-` (no nvcc) so 0.17.x crashes at
+      import. For multi-GPU full fine-tune use torch FSDP via accelerate:
+          accelerate launch --config_file fsdp.yaml train.py ...
+    - flash-attn — ships as source-only (20+ min compile per build) and
+      requires nvcc, which the runtime base image does not ship. torch
+      2.7's sdpa backend is fine on Ada; set
+          model.config.attn_implementation = "sdpa"
+      in your training script to get the equivalent fused-attention speed.
+
+  Inference env (invoke via `vllm-python`, see "vLLM setup" below):
+    - vllm==0.19.1, torch 2.10+cu128, transformers 5.7+, isolated in /opt/vllm.
+    Training is cu118, inference is cu128; the inference venv brings its own
+    cu12 runtime libs and exposes them via /usr/local/bin/vllm-python's
+    LD_LIBRARY_PATH wrapper, so the two stacks coexist without clobbering
+    each other (different torch / transformers / cuda runtime).
+
+  Pre-downloaded base model (no network needed):
+  - Qwen/Qwen2.5-Coder-3B (3.09B params)
+  Load via: AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-Coder-3B')
+  (cached in HF cache at image build time, no download needed)
+
+  ## Time budget strategy (total 10h per attempt, 4x 48 GB RTX 6000 Ada)
+  Reasonable rough split:
+    - LoRA 1-2 epoch:        train 3-4h   + eval 0.5h  → leaves 5-7h for debug
+    - QLoRA 2-3 epoch:       train 3-5h   + eval 0.5h  → similar
+    - Full FT 1 epoch:       train 5-6h   + eval 1h    → fits comfortably on
+                                                          4x48 GB, just FSDP +
+                                                          bf16 + AdamW32
+  Tips:
+    - Prefer LoRA / QLoRA first to get a baseline in <3h, THEN decide whether
+      to spend the remaining budget on a longer run.
+    - Eval execution is already parallelised by the evaluator (16-way thread
+      pool, 240s per-case timeout, 25-min global deadline → ~5-15 min wall
+      typically). You do NOT need to parallelise the test runner yourself.
+    - Generation IS on you: use vLLM (tensor_parallel_size up to 4) to finish
+      all 1,140 prompts in 1-5 minutes. HF `transformers.generate()` in a
+      loop will take 20-60 minutes and eat your budget. See "vLLM setup" below.
+    - Full fine-tune on 200k samples is comfortable on 4x48 GB. Plain bf16
+      + FSDP FULL_SHARD + AdamW32 + seq_len 2048 + batch_size 2 peaks around
+      ~30-36 GB/GPU. `gradient_checkpointing=True` brings it under 24 GB/GPU
+      if you want to push batch_size higher. 8-bit AdamW from bitsandbytes
+      is optional here (helps speed/memory but not required to fit).
+      LoRA / QLoRA run very loose (under 20 GB/GPU), leaving plenty of room
+      for larger batches or longer context.
+
+  ## Training-data quality
+  OpenCodeInstruct samples carry `average_test_score` and `tests_execution_status`.
+  Filtering to `average_test_score >= 0.9` or `tests_execution_status == "pass"`
+  typically shrinks data by ~30–50% but improves signal. Consider it.
+
+  ## vLLM setup (pre-installed, isolated venv) — IMPORTANT, READ CAREFULLY
+
+  Two separate Python environments coexist in this image:
+
+  1. TRAINING env (default `python`, /usr/bin/python):
+       torch 2.7.1+cu118 · transformers 4.46.3 · peft · trl
+       · bitsandbytes · accelerate · datasets · safetensors · sklearn / pandas
+       Use this for: train.py, data preprocessing, LoRA merging, anything
+       that touches peft / trl / bitsandbytes.
+
+  2. INFERENCE env (`vllm-python`, /opt/vllm/bin/python via wrapper):
+       torch 2.10+cu128 · transformers 5.7+ · vllm 0.19.1
+       Has: vllm, transformers, tokenizers, safetensors, numpy.
+       Does NOT have: peft, trl, bitsandbytes, accelerate.
+
+  predict.py contract — the framework calls predict.py via `vllm-python`
+  automatically (eval_contract.interpreter), so just write:
+
+      # /workspace/predict.py
+      from vllm import LLM, SamplingParams
+      llm = LLM(model="/workspace/ckpt_merged",
+                tensor_parallel_size=4, dtype="bfloat16",
+                max_model_len=4096, gpu_memory_utilization=0.85)
+      sp  = SamplingParams(temperature=0.0, max_tokens=1024,
+                           stop=["```\n\n"])
+      outs = llm.generate(prompts, sp)
+      # ... write {"predictions": [...]} to args.output
+
+  KEY CONSEQUENCE for LoRA users:
+    Because predict.py runs in a venv WITHOUT peft, you cannot
+    `PeftModel.from_pretrained(adapter)` inside predict.py. Two options:
+      (A) After training, merge the LoRA into the base weights and save
+          the merged model:
+            merged = peft_model.merge_and_unload()
+            merged.save_pretrained("/workspace/ckpt_merged")
+          Then point vLLM at /workspace/ckpt_merged. (Recommended.)
+      (B) Use vLLM's native LoRA adapter support:
+            llm = LLM(model="Qwen/Qwen2.5-Coder-3B", enable_lora=True,
+                      max_lora_rank=64)
+            outs = llm.generate(prompts, sp,
+                                lora_request=LoRARequest("a", 1,
+                                "/workspace/lora_adapter"))
+
+  If you really need to call vLLM from inside the training env (e.g. for
+  a quick dev sanity check), use:
+      subprocess.run(["/usr/local/bin/vllm-python", "your_script.py", ...])
+
+  ## Critical: strip markdown fences in predict.py
+  Training completions keep ```python ... ``` fences, so the model will emit them.
+  Before writing predictions.json, strip them, e.g.:
+      import re
+      def clean(t):
+          m = re.search(r"```(?:python)?\\s*\\n(.*?)```", t, flags=re.DOTALL)
+          return m.group(1) if m else t
+  Failing to do this causes SyntaxError on every test case → pass@1 = 0.
+
+  ## Common pitfalls (READ BEFORE FIRST ITERATION)
+
+  1. NEVER launch training as `python train.py` on a multi-GPU box.
+     The HF Trainer (transformers 4.46.3) wraps the model in `nn.DataParallel`
+     when it sees multiple visible CUDA devices, then in 4.46.x it passes
+     `num_items_in_batch` (a 0-d scalar tensor) into compute_loss. DataParallel
+     tries to scatter that scalar across GPUs and dies with:
+         RuntimeError: chunk expects at least a 1-dimensional tensor
+     Use one of these instead:
+         torchrun --nproc_per_node=4 train.py ...        # DDP, recommended
+         accelerate launch --num_processes 4 train.py    # DDP via accelerate
+         CUDA_VISIBLE_DEVICES=0 python train.py ...      # single-GPU dev
+     For FSDP (full FT), use `accelerate launch` with an FSDP config.
+
+  2. /data is mounted differently in the two phases.
+     - In the SANDBOX (`farbench.runner` runs your `command:`): `/data` =
+       train data, with train.jsonl + val.jsonl + dataset_info.json.
+       There is NO test_prompts.jsonl here.
+     - In the EVAL CONTAINER (framework runs predict.py): `/data` =
+       test data, with test_prompts.jsonl + test_cases.jsonl.
+       There is NO train.jsonl/val.jsonl here.
+     Consequence: do all training-time eval/sanity-check on val.jsonl, NEVER
+     try to read /data/test_prompts.jsonl from inside train.py or sandbox
+     scripts. Your predict.py only ever runs in the eval container, where
+     test_prompts.jsonl is the right name.
+
+  3. Don't mix bash heredoc with shell operators on the same line.
+     `python - <<'PY' ... PY && next-cmd` parses as part of the heredoc
+     body. Either close the heredoc on its own line and put `&&` on the
+     next line, or split into two separate `command:` invocations across
+     iterations.
+
+  4. predict.py runs in the vllm venv (no peft / trl / bnb). If you import
+     anything from those in predict.py it will fail with ModuleNotFoundError.
+     Do all model-stitching (merge_and_unload, dequantize, etc.) inside
+     train.py and save the resulting full model to checkpoints/.../merged/.
+
+  5. LoRA / QLoRA + `gradient_checkpointing=True` requires ONE extra line,
+     or autograd will report:
+         RuntimeError: element 0 of tensors does not require grad and does
+                       not have a grad_fn
+     Reason: gradient checkpointing re-runs the forward pass inside a
+     `torch.no_grad()` block, so the residual/embedding activations that
+     feed the LoRA adapters arrive without `requires_grad=True`. The LoRA
+     output then has no grad_fn and backward() dies.
+     Fix: call this right after loading the base model, BEFORE wrapping
+     with peft's `get_peft_model`:
+         model = AutoModelForCausalLM.from_pretrained(...)
+         model.gradient_checkpointing_enable()      # or TrainingArguments(...)
+         model.enable_input_require_grads()         # <── THE MISSING LINE
+         model = get_peft_model(model, lora_config)
+     Equivalent for QLoRA: `prepare_model_for_kbit_training(model)` already
+     calls `enable_input_require_grads()` internally, so as long as you use
+     that helper you're fine. If you skip `prepare_model_for_kbit_training`
+     you must call `enable_input_require_grads()` manually.
+
+  6. Custom `TrainerCallback` MUST subclass `transformers.TrainerCallback`.
+     Writing `class MetricsCallback:` (without the base class) compiles
+     fine but the Trainer's `CallbackHandler.call_event(...)` invokes
+     `on_init_end`, `on_log`, `on_step_end`, etc. via attribute lookup, so
+     at runtime you get:
+         AttributeError: 'MetricsCallback' object has no attribute 'on_init_end'
+     Fix — always inherit the base class:
+         from transformers import TrainerCallback
+         class MetricsCallback(TrainerCallback):
+             def on_log(self, args, state, control, logs=None, **kw):
+                 ...
+     You only need to override the hooks you care about; the base class
+     provides no-op defaults for the rest.
+
+  7. tokenizer + DataCollator must agree on padding, or every rank dies with:
+         ValueError: Unable to create tensor, you should probably activate
+                     truncation and/or padding ... features (`text` in this
+                     case) have excessive nesting (inputs type `list` where
+                     type `int` is expected).
+     Root cause: when the per-sample tokenization output has variable length
+     (different `len(input_ids)` per row), the collator must pad them to the
+     same length before stacking into a tensor. Two correct combinations:
+
+       (A) Pad inside `tokenizer(...)`, then default collator works:
+             enc = tokenizer(text, truncation=True,
+                             padding="max_length", max_length=2048)
+           → every row is exactly max_length tokens, default_data_collator
+           or DataCollatorForLanguageModeling can stack directly. Simple,
+           wastes memory on short rows.
+
+       (B) Don't pad in tokenizer, let an HF collator pad per-batch:
+             enc = tokenizer(text, truncation=True, max_length=2048)
+             # NO padding=
+             collator = DataCollatorWithPadding(tokenizer, padding="longest")
+             # or for causal LM with masked labels:
+             collator = DataCollatorForSeq2Seq(tokenizer, padding="longest",
+                                               label_pad_token_id=-100)
+           → recommended. Pads only to the longest row IN the batch.
+
+     What FAILS:
+       - tokenizer(..., padding=False) + DataCollatorForLanguageModeling
+         (the default LM collator expects rows to already be the same
+         length OR for `mlm=True`; for causal LM with variable lengths it
+         hits the error above).
+       - Custom collator that returns a python list of lists for
+         `input_ids` instead of a torch.Tensor — the Trainer assumes
+         tensors and feeds them straight to the model.
+       - Tokenizing without `truncation=True` so a single long row
+         exceeds max_length, then padding to model max → OOM, not the
+         tensor error, but equally fatal.
+
+     Quick sanity check before launching the Trainer:
+         batch = collator([dataset[0], dataset[1]])
+         assert batch["input_ids"].shape[0] == 2  # ← a real torch.Tensor
+     If this assert fails or raises, your collator is wrong; fix it
+     BEFORE wasting GPU time on `trainer.train()`.

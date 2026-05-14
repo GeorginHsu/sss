@@ -1,0 +1,421 @@
+name: vlabench_manipulation
+domain: robotics
+subdomain: Manipulation Learning
+description: |
+  Train a vision-language-action manipulation policy on the FARBench VLABench
+  training set; evaluated by `success_rate` over 60 official-track rollouts
+  (3 benchmark tasks × 20 episodes) in the VLABench MuJoCo simulator.
+
+  ## Data Format
+
+  Training data is at $FARBENCH_DATA_DIR (mounted as /data in the agent container):
+
+      /data/vlabench_train/
+          dataset_info.json        # FARBench manifest; read first
+          schema.json              # unified episode schema
+          meta/tasks.json          # per-task metadata
+          meta/dataset_info.json   # source-dataset metadata
+          train/task_NNN/episode_NNNNNN.hdf5 # 40 task dirs (task_000–task_039), 1693 HDF5 episodes total
+      /data/vlabench_root/
+          assets/                  # MuJoCo meshes / scenes used by VLABench
+
+  `dataset_info.json` must report `training_data_prepared: true`; if not, the
+  preparation step failed and the run should stop instead of falling back to
+  a heuristic.
+
+  Each episode HDF5 file (FARBench unified VLA schema, converted from
+  `lerobot/libero`) layout:
+
+      observation/rgb      uint8,   shape (T, 2, H, W, 3)
+      observation/state    float32, shape (T, 8)
+      action               float32, shape (T, 7)
+      task_index           int64 scalar
+      instruction          h5py object dtype, scalar — read as
+                           f["instruction"][()].decode("utf-8")
+      source_dataset       h5py object dtype, scalar (identifies LIBERO
+                           source) — same .decode("utf-8") pattern
+
+      attrs:
+          fps                                   float (10.0 in current data)
+          schema_version                        "farbench-vla-unified-v1"
+          state_dim                             8
+          action_dim                            7
+          num_frames                            int (varies per episode)
+          view_names_json                       JSON-string '["image", "image2"]'
+                                                (parse with json.loads if needed)
+
+  Sample episode shapes (from /data/vlabench_train/train/task_000/episode_000000.hdf5):
+  rgb=(214, 2, 256, 256, 3), state=(214, 8), action=(214, 7),
+  instruction="put the white mug on the left plate and put the yellow and
+  white mug on the right plate". Read H/W from the file (do not hardcode).
+
+  Note: this training schema (2 views, 8-D state, 7-D LIBERO EE-style action)
+  is NOT the same as the live VLABench simulator runtime, which exposes a
+  9-D Franka action spec. See `agent_hints` for the policy/action interface
+  contract and the Pi0 pretrained-checkpoint feature contract.
+
+  Test config is at $FARBENCH_TEST_DATA_DIR (mounted as /data during evaluation):
+
+      /data/eval_config.json   # benchmark_tasks, episodes_per_task,
+                               # max_steps_per_episode, seed,
+                               # eval_track="track_1_in_distribution",
+                               # eval_track_path, evaluation_protocol
+
+  ## Predict Script Contract
+
+  Create predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>
+
+  Input: --data_path is the directory containing eval_config.json. Run the
+  3 benchmark tasks listed there using the official VLABench
+  `track_1_in_distribution` protocol (60 episodes total). The official base
+  evaluator is imported as `from VLABench.evaluation.evaluator.base import
+  Evaluator` (the image patches `VLABench.evaluation` and
+  `VLABench.evaluation.evaluator` to re-export this same class). Naked
+  random `load_env(task)` sampling is only acceptable for local smoke tests,
+  not for the final eval.
+
+  Output: JSON file with one record per rollout:
+    {
+      "episodes": [
+        {"task": "add_condiment", "episode_index": 0, "success": true},
+        ...
+      ],
+      "total_episodes": 60
+    }
+  Aggregated success_rate-only outputs are rejected; the evaluator
+  recomputes success_rate and per-task success from the per-episode records.
+
+compute_type: gpu
+# Budget review (refreshed 2026-05-01, post-Patch-5):
+#   * 4 GPUs is the safe fit for Pi0 fine-tune (4.1 B fp16 ~8 GB/card,
+#     LoRA + grad-ckpt fits with comfortable headroom). Smaller models
+#     could survive 2 GPUs but 4 remains the planning baseline.
+#   * Eval cost (60 episodes × 250 max-steps × ~0.9 s/step) ≈ 2.5–3.5 h
+#     after Dockerfile Patch 5 (skip depth/seg/mask render when
+#     require_pcd=False). Pre-Patch-5 was 6–7 h.
+#   * `total_time_budget_hours: 10` therefore leaves 6–8 h training
+#     headroom after one full 60-episode eval; enough for several
+#     short LoRA cycles + 1–2 full evals.
+max_gpu_count: 4
+# CPU/RAM caps are sized for 4-GPU HDF5 training plus parallel MuJoCo eval.
+# The 34 GB HDF5 train set should be streamed, not fully cached in memory.
+max_cpu_cores: 32
+max_memory_gb: 128
+total_time_budget_hours: 10
+max_iterations: 30
+network_access: false
+max_model_params_billion: 5.0
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/vlabench_manipulation/
+test_data_dir: /rab_data/vlabench_manipulation_test/
+docker_image: farbench/farbench:vlabench_manipulation-cu118
+
+# Evaluation
+primary_metric: success_rate
+higher_is_better: true
+evaluator_class: benchmarks.vlabench_manipulation.script.evaluator.VLABenchEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>"
+  input_format: "data_path contains eval_config.json with benchmark_tasks, episodes_per_task, max_steps_per_episode, seed, eval_track, eval_track_path, evaluation_protocol"
+  output_format: '{"episodes": [{"task": "add_condiment", "episode_index": 0, "success": true}, ...], "total_episodes": 60}'
+
+agent_hints: |
+  ## 1. Pre-installed packages (single Python 3.12 environment) (do NOT reinstall)
+
+  This image runs a single Python 3.12 interpreter (`/usr/bin/python`).
+  VLABench + lerobot + the rest of the ML stack live in the same
+  process — no cross-venv bridge needed:
+
+    VLABench (editable at /opt/VLABench), lerobot[pi]==0.5.1,
+    torch==2.7.1+cu118, torchvision==0.22.1, transformers==5.3.0,
+    safetensors, mujoco==3.2.2, dm_control==1.0.22, gym, gymnasium,
+    open3d==0.19.0, opencv-python-headless, mediapy, h5py, scipy,
+    numpy, diffusers, accelerate, einops, timm, open-clip-torch,
+    peft, bitsandbytes, zarr, pyquaternion, deepspeed, datasets,
+    huggingface_hub, wandb, tensorboard,
+    openai (imported by VLABench.utils.gpt_utils — never called).
+
+  `lerobot[pi]==0.5.1` hard-pins `transformers==5.3.0`. Do NOT
+  `pip install -U transformers` — upgrading crashes
+  `PI0Policy.from_pretrained` with `'NoneType' object is not
+  subscriptable` at modeling_pi0.py:359 (paligemma drops out of
+  CONFIG_MAPPING). Network is disabled at runtime — fail fast on
+  missing data/model rather than fall back.
+
+  ## 2. Default policy strategy (intended track)
+
+  Start from `lerobot/pi0_base` and adapt it. This is the intended
+  baseline track, not just one optional approach. A tiny CNN/MLP trained
+  from scratch on the HDF5 files, nearest-neighbour retrieval over train
+  RGB, a CPU-only policy, or a pure behaviour-cloning baseline is the
+  wrong track for this task: the train/runtime camera, state, and action
+  conventions differ enough that these routes have repeatedly produced
+  0.0 success despite full 60-episode evals.
+
+  A fast first iteration should validate the cached Pi0 baseline and the
+  LeRobot preprocessing path, then build the minimal Pi0-compatible
+  data/action adapter. Because a full official eval costs about 2 hours,
+  use local smoke tests and short non-official rollouts to catch import,
+  shape, action-bridge, and exception-handling bugs before spending a full
+  eval submission. Subsequent iterations should improve the Pi0-derived
+  policy via adapter/LoRA/action-bridge changes, not replace it with a
+  small CPU/from-scratch model.
+
+  If Pi0 cannot be loaded, stop and surface the exact import/load error.
+  Do not silently fall back to a small from-scratch model; that hides
+  environment problems and usually wastes the 10h budget.
+
+  ## 3. Pre-downloaded model
+
+  `lerobot/pi0_base` (~4 B params, fits 5 B cap) is in the HF
+  cache at `/root/.cache/huggingface/hub/models--lerobot--pi0_base`.
+  The separate PaliGemma tokenizer assets referenced by Pi0's LeRobot
+  processor are also cached under `google/paligemma-3b-pt-224`; if
+  `make_pre_post_processors` cannot instantiate the tokenizer offline,
+  the Docker image is incomplete and the run should stop with that exact
+  cache error. That tokenizer repo is gated by Google's license on
+  Hugging Face, so image build needs `HF_TOKEN` for an account that has
+  accepted the PaliGemma/Gemma terms; runtime remains offline and should
+  not require any token.
+  It is the default high-resource base because public VLABench primitive
+  evals report pi0_base (44.5 overall) above pi05_base (42.0 overall).
+  Load by canonical id only (no filesystem path):
+
+      python -c "from lerobot.policies.pi0 import PI0Policy; \
+                 PI0Policy.from_pretrained('lerobot/pi0_base')"
+
+  Any process calling `from_pretrained` must export `HF_HUB_OFFLINE=1`
+  first (otherwise tries the network). Save LoRA adapters under
+  `/workspace/checkpoints/<name>/`; load via either `merge_and_unload`
+  before save, or `PeftModel.from_pretrained(base, ckpt_dir)`.
+
+  ## 4. Pi0 input/output contract (lerobot 0.5.1)
+
+  Class `lerobot.policies.pi0.modeling_pi0.PI0Policy`. NO `.predict()`
+  method exists — use:
+      forward(batch, reduction="mean") -> (loss, info)   # training
+      select_action(batch)             -> Tensor          # 1 step
+      predict_action_chunk(batch)      -> Tensor          # n_action_steps=50
+
+  Pretrained ckpt config (LIBERO defaults, image_resolution=(224,224),
+  max_state_dim=32, max_action_dim=32, n_action_steps=50):
+
+      observation.images.base_0_rgb         (3, 224, 224)  VISUAL
+      observation.images.left_wrist_0_rgb   (3, 224, 224)
+      observation.images.right_wrist_0_rgb  (3, 224, 224)
+      observation.state                     (32,)          STATE
+      action                                (32,)          ACTION
+
+  forward() also reads (raises if missing):
+      observation.language.tokens           int64 PaliGemma ids
+      observation.language.attention_mask   int64
+      complementary_data["task"]            raw str instruction
+
+  Adaptation gap from training data (2 views / 8-D state / 7-D EE
+  action) to ckpt (3 views / 32-D / 32-D): reuse LIBERO key names +
+  zero-pad missing slots, OR override `config.input_features`
+  (re-randomises that part of the vision tower). State/action are
+  zero-padded to 32-D internally; compute loss only on active dims.
+  `task_index` spans the 40 train task dirs, not just the 3 eval task
+  names; any task embedding/head must support at least ids 0..39.
+
+  Processor pipeline is a SEPARATE object (NOT `policy.processor`).
+  Load it with the LeRobot factory rather than building tokens by hand:
+      from lerobot.policies.factory import make_pre_post_processors
+      preprocess, postprocess = make_pre_post_processors(
+          policy.config,
+          "lerobot/pi0_base",
+          preprocessor_overrides={"device_processor": {"device": str(device)}},
+      )
+
+  ## 5. VLABench runtime contract
+
+  Import:
+      from VLABench.evaluation.evaluator.base import Evaluator
+  (image patches `VLABench.evaluation` and `.evaluator` to re-export
+  this same class.)
+
+  Evaluator constructor (verified):
+      Evaluator(tasks: list[str], n_episodes: int, episode_config=None,
+                max_substeps=1, tolerance=0.01,
+                metrics=["success_rate"], save_dir=None,
+                visulization=False,    # sic — upstream typo
+                eval_unseen=False, unnorm_key="primitive", **kwargs)
+  `episode_config` accepts a path string (auto-parsed via json.load
+  in __init__) or a pre-parsed dict. Pass `eval_config.json`'s
+  `eval_track_path` field.
+
+  `Evaluator.evaluate(agent)` takes no `max_episode_steps` argument. If
+  you need fixed horizons for the JSON contract, loop over episodes and
+  call `evaluate_single_episode(..., max_episode_length=max_steps)`.
+  The keyword is `max_episode_length`, not `max_episode_steps`.
+
+  **If you OVERRIDE `Evaluator.evaluate`**, you MUST replicate the
+  per-episode indexing the base class does:
+      info = self.evaluate_single_episode(
+          agent, task, i,
+          self.episode_config[task][i],   # ← per-episode dict
+          **kwargs)
+  Track json shape is `{task_name: [per_episode_cfg, ...]}` and each
+  per-episode cfg is `{"task": {...}}`. Passing the whole track dict
+  raises `KeyError: 'task'` inside `dm_task.build_from_config`.
+  Do not rely on a `.tasks` attribute on the upstream Evaluator; keep
+  the `tasks` list from `eval_config.json` in your own wrapper.
+
+  Agent class contract (Evaluator calls these — missing attrs raise
+  AttributeError):
+      class YourAgent:
+          name = "<arbitrary id>"            # used by tqdm
+          control_mode = "ee" | "joint"      # selects action format
+          def reset(self): ...               # called once per episode
+          def predict(self, observation, **kwargs):
+              # observation keys: rgb, ee_state, instruction,
+              #                   robot_frame, last_action
+              # control_mode="ee":    return (pos:(3,) f32,
+              #                               euler:(3,) f32,
+              #                               gripper:(2,) f32)
+              # control_mode="joint": return (qpos:(7,) f32,
+              #                               gripper:(2,) f32)
+              ...
+
+  When bridging Pi0/LIBERO 7-D actions to `control_mode="ee"`, validate
+  the convention with a short rollout. Do not pass raw normalized LIBERO
+  actions as absolute VLABench world poses. A reasonable bridge clips the
+  first 6 active dims as small deltas around the current `ee_state` pose
+  and maps the 7th dim to the two-finger gripper; repeated
+  `Failed to converge after 99 steps` IK warnings usually mean the target
+  pose/action bridge is wrong, not that assets are missing.
+
+  VLABench env is `dm_control` (NOT gym):
+    - `env.reset()` takes NO kwargs (no `seed=`); seed via
+      `np.random.seed(s); random.seed(s)` BEFORE `load_env(...)`.
+    - `env.step(a)` returns a `dm_env.TimeStep` (`.observation` dict,
+      `.reward`, `.step_type`, `.last()`).
+    - `env.action_spec()` is 9-D for Franka (7 joints + 2 fingers).
+      The Evaluator accepts EE-control policies returning
+      `(pos, euler, gripper)` and converts to qpos/IK internally.
+      If you call `env.step()` yourself, pass a 9-D float32 action.
+    - `ts.observation` after `env.reset()` may be empty; use
+      `env.get_observation(require_pcd=False)`. Default obs keys
+      (post-Patch-5): rgb (4,480,480,3) uint8, q_state, q_velocity,
+      q_acceleration, intrinsic, extrinsic, ee_state, grasped_obj_name,
+      task_observables. `require_pcd=True` adds depth + segmentation
+      + robot_mask + point clouds at ~3× wall-clock cost.
+
+  predict.py runs ONLY in the eval container (its /data is the test
+  mount with `eval_config.json`). Running predict.py in the training
+  sandbox raises `FileNotFoundError: '/data/eval_config.json'` —
+  submit via EvalSubmission instead.
+
+  ## 6. Compute resources
+
+  Allocated **up to**: 4 GPUs,
+  32 CPU cores, 128 GB RAM. This is an upper bound — FARBench may give
+  fewer GPUs under contention. Query `torch.cuda.device_count()` at
+  startup rather than hard-coding 4. Container device ids always
+  start at 0 regardless of host GPU mapping.
+  The intended policy path is GPU-backed Pi0 inference/training. CPU-only
+  model inference is only appropriate for small local smoke tests, not for
+  the official 60-episode eval. Use CPU cores for MuJoCo rollout workers;
+  keep policy inference on CUDA.
+
+  Entrypoint maps `127.0.0.1` and `::1` to the container hostname in
+  /etc/hosts, so torch.distributed rendezvous resolves to loopback
+  without DNS — `gai error: -3` warnings should not appear.
+
+  Same allocation applies to BOTH sandbox and eval containers, so
+  predict.py inherits the full pool. Naïve single-GPU /
+  single-process predict.py uses 1/N of the GPUs and ~1/32 of the
+  cores. Useful facts (capabilities, not prescriptions):
+    • Pi0 forward batch > 1: batch of 4 still costs ~300 ms
+      (compute bound by paligemma+expert, not batch dim).
+    • MuJoCo envs are CPU-bound and independent → N parallel sim
+      processes each consume ~1 core, fit easily on 32 cores.
+    • `env.get_observation` ~480 ms is the eval bottleneck;
+      sharding 60 episodes across N sim workers cuts wall-clock
+      ~linearly in N. Per-(task, episode_index) results merge
+      associatively into the final `{"episodes": [...]}`.
+    • For training: `DataLoader(num_workers=0)` + lazy HDF5 reads
+      starves the GPU on data IO; bf16/AMP roughly halves a forward
+      pass on Ada.
+
+  ## 7. Eval efficiency strategy
+
+  The official protocol is always the full 60-episode track; do not reduce
+  the episode count or switch to random `load_env(task)` sampling for a
+  submitted eval. Improve wall-clock by making `predict.py` efficient:
+    • Run independent simulator episodes in parallel worker processes and
+      merge per-(task, episode_index) results deterministically.
+    • Use Pi0 action chunks / a pending-action queue so one expensive model
+      forward is amortised across many simulator steps.
+    • Cache per-task language/preprocessor work and never reload the policy,
+      adapter, or processors inside a per-step or per-episode loop.
+    • Keep observations to RGB unless debugging locally; depth,
+      segmentation, masks, and point clouds are much slower and are not
+      needed for the default policy path.
+    • Treat full official eval as a scarce resource. Run it only after
+      local construction, output-shape, action-shape, and exception-logging
+      checks pass.
+
+  ## 8. Eval cost
+
+  Per-env-step breakdown (single GPU, post-Patch-5):
+      env.step             ~140 ms  physics
+      env.get_observation  ~480 ms  4 cams × rgb (1300 ms pre-Patch-5)
+      agent.predict        ~150–300 ms  in-process Pi0 select_action
+      total                ~0.8 s/step
+
+  60 ep × 250 steps × 0.8 s ≈ 3.3 h worst case; ~2.3 h with ~30 %
+  success. `total_time_budget_hours: 10` therefore leaves 6–8 h
+  for training after one full eval.
+
+  `predict_action_chunk(batch)` returns 50 actions per forward,
+  amortising the Pi0 forward cost across steps (recovers most of
+  the ~50 min spent on per-step inference at 60 ep × 250 steps × ~200 ms).
+  Simulator wall-clock still dominates.
+
+  ## 9. Common environment pitfalls
+
+  1. **HDF5 + DataLoader fork**: opening `h5py.File(...)` in
+     `Dataset.__init__` and reading from `num_workers > 0` workers
+     gives sporadic `OSError: Can't synchronously read data`. Open
+     lazily inside `__getitem__`:
+         if path not in self._h5:
+             self._h5[path] = h5py.File(path, "r", swmr=True)
+
+  2. **Train HDF5 schema ≠ runtime obs**: training keys are
+     `observation/rgb`, `observation/state`, 7-D action (LIBERO
+     unified). Runtime obs from `env.get_observation()` uses
+     `rgb`, `ee_state`, `instruction`, `robot_frame`, `last_action`.
+     Inspect one `load_env(task)` rollout locally before wiring the
+     full predict.py.
+
+  3. **Do not swallow per-episode exceptions silently**: broad
+     `except Exception: success = False` can make a broken evaluator,
+     missing checkpoint, or bad observation adapter look like a valid
+     60-episode 0.0 result. During development, print task,
+     episode_index, and traceback to stderr and re-raise. If you choose
+     to keep going in a final eval, still log every exception and count
+     them in stderr.
+
+  4. **Avoid RGB retrieval as the main policy**: train RGB is 2-view
+     256×256 LIBERO data, while runtime RGB is 4-view 480×480 VLABench.
+     Nearest-neighbour keys over raw pixels usually retrieve unrelated
+     actions and create IK failures.
+
+  5. **Avoid CPU-only from-scratch policies**: the intended baseline is
+     Pi0-derived. If the model path never uses the cached Pi0 baseline,
+     the run is likely solving the wrong track and wasting full-eval time.
+
+  6. **Validate output shape before a full eval**: `Agent.predict()` with
+     `control_mode="ee"` must return `(pos(3,), euler(3,), gripper(2,))`
+     float arrays. JSON output must contain exactly the requested
+     `(task, episode_index)` pairs from `eval_config.json`.
+
+  7. `/workspace/` persists across iterations (checkpoints, logs).
+     `/tmp/` and `/data` do not.

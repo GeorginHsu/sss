@@ -1,0 +1,500 @@
+name: habitat3
+domain: robotics
+subdomain: Reinforcement Learning
+description: |
+  Train a social-navigation policy for the Boston Dynamics **Spot** robot in
+  Habitat 3.0 (Puig et al., 2023, https://arxiv.org/abs/2310.13724). The robot
+  shares a multi-room HSSD-200 home with a randomly-walking humanoid avatar
+  and must repeatedly *find* and *follow* the human while avoiding collisions.
+
+  Your goal: maximise `nav_seek_success` on the baked validation split: an
+  episode succeeds only if Spot
+  accumulates at least 500 steps at safe social distance (`1.0 <= distance <
+  2.0` meters) while facing the humanoid. The Habitat config names the
+  measurement `social_nav_seek_success`; `env.get_metrics()` exposes the
+  result as `nav_seek_success` — use that key verbatim.
+
+  ## Multi-Agent Setup
+
+  The Habitat task config is `RearrangePddlSocialNavTask-v0`
+  (config file: `benchmark/multi_agent/hssd_spot_human_social_nav.yaml`):
+
+    - **agent_0** = Spot (`spot` URDF, kinematic mode). YOUR policy controls
+      this agent. Action: 2-D base velocity (longitudinal + angular).
+    - **agent_1** = Humanoid avatar (`hab3_humanoid` from humanoid_data).
+      Driven by an *oracle random-coord nav* — it walks to random reachable
+      points in the scene by itself. You DO NOT train or control agent_1.
+
+  Episode terminates after `max_episode_steps = 750` simulation steps in the
+  shipped config. Success is `nav_seek_success`: Spot must maintain
+  `safe_dis_min = 1.0 m <= distance < safe_dis_max = 2.0 m` while facing the
+  human for `following_step_succ_threshold = 500` accumulated steps. Do NOT
+  confuse this with the easier distance-only `nav_to_pos_success`.
+
+  ## Environment
+
+  Habitat-Sim 0.3.3 (headless EGL + Bullet) and habitat-lab 0.3.3 are
+  pre-installed in the conda env `habitat` (Python 3.9). The container
+  entrypoint sets up `/opt/habitat-lab-src/data → /rab_data/habitat3`
+  (image-baked, ~25 GB) and exposes the same tree at `/workspace/data`.
+
+  Available data (read these paths verbatim):
+
+    - Scene dataset — H3 modified HSSD (use this one, see Quick-start):
+        /opt/habitat-lab-src/data/hab3_bench_assets/hab3-hssd/
+        Config: `hab3-hssd.scene_dataset_config.json` (already patched at
+        build time to register the `hssd_ssd_map` semantic tag).
+    - Original HSSD-200 (only used for semantic lexicon; you do NOT need
+      to point to this directly):
+        /opt/habitat-lab-src/data/scene_datasets/hssd-hab/
+    - Episode dataset currently baked into this benchmark:
+        /opt/habitat-lab-src/data/datasets/hssd/rearrange/{train,val}/social_rearrange.json.gz
+        These are symlinks to `hab3_bench_assets/episode_datasets/medium_medium.json.gz`
+        (scene-size & object-size both "medium"). Important: each
+        `hab3_bench_assets/episode_datasets/<size>_<size>.json.gz` file has
+        only 10 episodes, and train/val currently point to the same source.
+        If this benchmark is later changed to official SocialNav episodes,
+        switch the data UID/source to `hab3_episodes` instead of relying on
+        `hab3_bench_assets`.
+    - YCB object configs:
+        /opt/habitat-lab-src/data/objects/ycb/
+    - Spot URDF (agent_0, Boston Dynamics Spot quadruped):
+        /opt/habitat-lab-src/data/robots/hab_spot_arm/
+    - Humanoid avatars (agent_1, SMPL-X-style female motion data):
+        /opt/habitat-lab-src/data/humanoids/humanoid_data/
+
+  Habitat resolves all `data/...` paths **relative to cwd**. You MUST call
+  `os.chdir('/opt/habitat-lab-src')` BEFORE `import habitat` in EVERY script
+  (train.py, predict.py, any test scripts). The eval container is read-only
+  on `/workspace`, so do NOT chdir into `/workspace`.
+
+  ## Observation Space (Spot's POV — what your policy gets at each step)
+
+  The full env returns a flat dict (multi-agent obs are namespaced by
+  `agent_X_`). For Spot's policy you only need agent_0_* keys:
+
+    - `agent_0_head_rgb`                     : uint8   (256, 256, 3)
+    - `agent_0_head_depth`                   : float32 (256, 256, 1)
+    - `agent_0_articulated_agent_arm_rgb`    : uint8   (480, 640, 3)
+    - `agent_0_articulated_agent_arm_depth`  : float32 (240, 228, 1)
+    - `agent_0_head_stereo_left_depth`       : float32 (212, 120, 1)
+    - `agent_0_head_stereo_right_depth`      : float32 (212, 120, 1)
+    - `agent_0_spot_head_stereo_depth_sensor`: float32 (240, 228, 1)
+    - `agent_0_humanoid_detector_sensor`     : float32 (1,) binary "human in view"
+                                                (config sets return_image=False)
+    - `agent_0_goal_to_agent_gps_compass`    : float32 (2,) [dist, angle] to human
+    - `agent_0_other_agent_gps`              : float32 (2,) relative human position
+    - `agent_0_localization_sensor`          : float32 (4,) Spot pose proxy
+
+  agent_1_* keys are humanoid-internal sensors — your policy does NOT need
+  them (the oracle nav handles agent_1's actions).
+
+  ## Action Space
+
+  Multi-agent actions are passed as a *flat dict*. Spot's policy outputs
+  ONLY agent_0's base velocity; agent_1's oracle nav is invoked
+  automatically by the env. Pass agent_1's no-op explicitly each step:
+
+      action = {
+          "action": ("agent_0_base_velocity", "agent_1_oracle_nav_randcoord_action"),
+          "action_args": {
+              # agent_0: Spot base velocity (2-D, lateral disabled)
+              "agent_0_base_vel": np.array([lin, ang], dtype=np.float32),  # ∈ [-1, 1]^2
+              # agent_1: oracle picks its own coord, just trigger the action
+              "agent_1_oracle_nav_randcoord_action": np.array([1.0], dtype=np.float32),
+          },
+      }
+
+  - `agent_0_base_vel[0]` = forward speed   (positive = forward, negative = backward)
+  - `agent_0_base_vel[1]` = angular speed   (positive = turn left)
+
+  Lateral motion is disabled (`enable_lateral_move: False`).
+
+  ## Quick-start Example
+
+      import os, numpy as np
+      os.chdir('/opt/habitat-lab-src')
+
+      import habitat
+      from habitat.config.default import get_config
+      from habitat.config import read_write
+
+      cfg_path = (
+          "/opt/habitat-lab-src/habitat-lab/habitat/config/"
+          "benchmark/multi_agent/hssd_spot_human_social_nav.yaml"
+      )
+      config = get_config(cfg_path)
+      with read_write(config):
+          config.habitat.simulator.scene_dataset = (
+              "/opt/habitat-lab-src/data/hab3_bench_assets/hab3-hssd/"
+              "hab3-hssd.scene_dataset_config.json"
+          )
+          config.habitat.dataset.scenes_dir = "/opt/habitat-lab-src/data/scene_datasets"
+
+      with habitat.Env(config=config) as env:
+          obs = env.reset()
+          # Inspect what's actually there:
+          print({k: getattr(v, "shape", v) for k, v in obs.items()})
+
+          for step in range(50):
+              action = {
+                  "action": ("agent_0_base_velocity",
+                             "agent_1_oracle_nav_randcoord_action"),
+                  "action_args": {
+                      "agent_0_base_vel": np.random.uniform(-1, 1, 2).astype(np.float32),
+                      "agent_1_oracle_nav_randcoord_action":
+                          np.array([1.0], dtype=np.float32),
+                  },
+              }
+              obs = env.step(action)
+              if env.episode_over:
+                  break
+          metrics = env.get_metrics()
+          # Real metric keys returned by env.get_metrics() in this image.
+          # Use these EXACT names — `social_nav_seek_success` does NOT exist
+          # as a top-level metric in habitat-lab 0.3.3.
+          print("seek_success:", metrics["nav_seek_success"])
+          print("reward:      ", metrics["social_nav_reward"])
+          print("stats:       ", metrics["social_nav_stats"])
+
+  ## Metrics (returned by `env.get_metrics()` in this image)
+
+  Top-level keys:
+    - `nav_seek_success` (float, 0/1): **PRIMARY METRIC**. 1 iff Spot
+      accumulates ≥500 steps with `1.0 <= distance_to_human < 2.0` AND facing
+      the human. Reported only at episode end (`env.episode_over == True`).
+    - `social_nav_reward` (float): Habitat's shaped social-nav measure. If you
+      need a per-step scalar reward in a raw `habitat.Env` loop, use the
+      adjacent-step difference `metrics_t["social_nav_reward"] -
+      metrics_{t-1}["social_nav_reward"]`, or use Habitat's gym wrapper step
+      reward. Do not treat the final cumulative/measurement value as a
+      ready-made per-step training reward.
+    - `nav_to_pos_success` (float, 0/1): distance-based success.
+    - `dist_to_goal` (float): meters to closest goal point.
+    - `robot_collisions` (dict): per-step / cumulative collision counts.
+    - `did_collide` (bool): collision flag for the current step.
+    - `articulated_agent_force` (float): magnitude of contact forces.
+    - `num_steps` (int): elapsed steps in this episode.
+
+  `social_nav_stats` (dict, also returned at episode end):
+    - `has_found_human` (bool)
+    - `found_human_rate_over_epi` (float, 0–1)
+    - `found_human_rate_after_encounter_over_epi` (float, 0–1)
+    - `avg_robot_to_human_dis_over_epi` (float, m)
+    - `avg_robot_to_human_after_encounter_dis_over_epi` (float, m)
+    - `first_encounter_spl` (float, 0–1; usually 0 here because shortest-path
+      computation is disabled in the current config)
+    - `frist_ecnounter_steps` (int) — note habitat's typo "frist"
+    - `frist_ecnounter_steps_ratio` (float, 0–1)
+    - `follow_human_steps_after_frist_encounter` (int)
+    - `follow_human_steps_ratio_after_frist_encounter` (float, 0–1; note the
+      typo in the key. In the current config this is typically 0.0 because
+      shortest-path-related fields are disabled, so it is only a diagnostic,
+      not a useful secondary leaderboard metric.)
+    - `backup_ratio` (float, 0–1) — % of steps moving backwards
+    - `yield_ratio` (float, 0–1) — % of steps yielding to human
+
+  Keys that do NOT exist (despite some H3 docs/papers): `social_nav_seek_success`,
+  `pddl_success`, `nav_to_pos_succ` (note: real key is `nav_to_pos_success`),
+  `follow_human_steps_after_frame_view`, `total_distance_to_human`. Do NOT
+  reference them — your code will KeyError.
+
+  ## Training
+
+  - On-policy (or off-policy) RL via simulator interaction. NO static dataset
+    to load — every training step interacts with the live MuJoCo-style sim.
+  - One env step ≈ 30–50 ms on a single GPU (depth rendering + 2-agent sim
+    + physics). 100k env steps ≈ 50–80 minutes per process.
+  - The episode dataset
+    `data/datasets/hssd/rearrange/train/social_rearrange.json.gz` is currently
+    a symlink to `hab3_bench_assets/episode_datasets/medium_medium.json.gz`,
+    which contains only 10 episodes. Train and val are currently same-source
+    splits. If you need official SocialNav train/val/test episodes, this task
+    should be migrated to the `hab3_episodes` data source.
+
+  IMPORTANT — Training monitoring:
+  - Each `env.step()` is ~40 ms (NOT ~1 ms). 100 PPO updates × 128 steps
+    ≈ 9 min just for stepping. Plan accordingly.
+  - Implement early stopping: if mean_reward and seek_success are both flat
+    after 100+ updates, STOP and try different hparams / reward shaping /
+    architecture. Do NOT let a non-converging run consume all 10 hours.
+  - Print progress (reward, seek_success, elapsed) every 10–20 updates.
+    Watch stdout/stderr — repeated `KeyError` / `Env step error` means
+    your action dict shape is wrong; STOP and fix immediately.
+
+  ## Predict Script Contract
+
+  Harness invocation (always with absolute paths):
+
+      python predict.py --data_path <abs_dir> --checkpoint <abs_ckpt_dir> --output <abs_json>
+
+  Note: `--data_path` exists only to satisfy FARBench's cross-task contract;
+  there is no static test set for this RL task. **Ignore `--data_path`**
+  and hardcode the eval config below in your predict.py.
+
+  predict.py MUST:
+    1. `os.path.abspath()` every CLI arg, THEN
+       `os.chdir('/opt/habitat-lab-src')`, THEN `import habitat`. (Skipping
+       step 1 makes any later `open()` resolve against `/opt/habitat-lab-src`
+       — see "PATH FOOTGUN" in agent_hints.)
+    2. Hardcode the eval params:
+           SPLIT = "val"; NUM_EPISODES = 50; SEED = 42
+      (Episodes come from the baked `val` symlink to
+      `hab3_bench_assets/episode_datasets/medium_medium.json.gz`. No external
+      test data needed. There are only 10 unique episode definitions in that
+      file, so 50 eval episodes means repeated sampling under the simulator
+      seed, not 50 unique official SocialNav episodes.)
+    3. Load `torch.load(os.path.join(args.checkpoint, "model.pt"))`. Save
+       the same filename in train.py.
+    4. Build env as in Quick-start (with the two `read_write` overrides),
+       run `NUM_EPISODES` episodes from `SPLIT`, write JSON to `<args.output>`.
+
+  Output JSON format (REQUIRED — exact key names; the evaluator re-aggregates
+  from `per_episode` regardless of top-level values). `safe_follow_steps` is
+  optional but strongly recommended: the evaluator uses it to recompute
+  `nav_seek_success = (safe_follow_steps >= 500)` under the true Habitat3
+  definition. If you do not emit it, the evaluator falls back to Habitat's own
+  episode-end `metrics["nav_seek_success"]`.
+
+      {
+          "primary_metric": "nav_seek_success",
+          "nav_seek_success":         0.42,
+          "social_nav_reward":        -3.1,
+          "found_human_rate_over_epi": 0.55,
+          "safe_follow_steps":         520,
+          "avg_robot_to_human_dis_over_epi": 1.85,
+          "nav_to_pos_success":        0.30,
+          "per_episode": [
+              {
+                  "episode_id": "0",
+                  "nav_seek_success":   1,
+                  "social_nav_reward":  4.2,
+                  "found_human_rate_over_epi": 0.7,
+                  "safe_follow_steps": 520,
+                  "avg_robot_to_human_dis_over_epi": 1.5,
+                  "nav_to_pos_success": 1
+              },
+              ...
+          ],
+          "total_episodes": 50
+      }
+
+  All aggregate fields MUST be the mean of `per_episode` values. The evaluator
+  re-computes them from `per_episode`, and for `nav_seek_success` it prefers
+  `safe_follow_steps >= 500` over a pre-computed success flag when present.
+
+  ## Constraints
+
+    - Model parameter count ≤ 1B.
+    - Training is on-policy simulator interaction; there is no static dataset
+      to fine-tune on. Log progress every 50 updates.
+    - The Habitat config is READ-ONLY (`OmegaConf` frozen struct). Wrap any
+      modification in `from habitat.config import read_write; with read_write(config): ...`
+      — this task requires the two dataset-path overrides shown in Quick-start.
+
+  ## Reference numbers from the literature
+
+  You have NO network access during the run, so these published baselines
+  are the only SOTA datapoints you'll get. Habitat 3.0 (Puig et al.,
+  ICLR 2024) reports the following for the Spot Social-Nav setup; "S" =
+  Finding Success, "SPS" = Success-weighted Path Steps, "F" = Following
+  Rate (1-2 m & facing), "CR" = Collision Rate:
+
+      Method                                         S       SPS     F       CR
+      ───────────────────────────────────────────────────────────────────────────
+      Heuristic Expert (map + shortest path)         1.00    0.97    0.51    0.52
+      End-to-end RL DDPPO (8-GPU × 100M+ env steps)  0.97    0.65    0.44    0.51
+      SDA (Scofano et al., CVPR-W'24)                0.91    0.45    0.39    —
+      COMM (CommNav, NeurIPS'25 extension)           0.78    —       0.51    —
+
+  Two non-obvious takeaways relevant to this benchmark's compute budget:
+   • The map+planner Heuristic Expert OUTPERFORMS end-to-end RL on this
+     benchmark. A planner-based or heuristic controller is a legitimate
+     research direction here, not a fallback.
+   • Paper RL was trained with ~100M env steps on 8 GPUs — orders of
+     magnitude beyond a 10-hour single-machine budget. Training PPO from
+     scratch is unlikely to converge in your budget; consider using or
+     imitating a classical controller before / instead of RL.
+
+  ## Tooling already installed that may be useful
+
+  habitat-lab 0.3.3 ships a navmesh-based geodesic path planner at
+      `habitat.tasks.nav.shortest_path_follower.ShortestPathFollower`
+  (the same class the paper's Heuristic Expert is built on). It was
+  designed for single-agent NavTask, so reusing it here requires some
+  glue: the goal is a moving humanoid, and the follower returns discrete
+  navigation actions while agent_0's action space is continuous
+  base-velocity. Read its source if you choose to use it (~80 lines).
+
+  ## Execution Priority
+
+    1. First, write a *short* test script (< 30 lines) that creates the
+       env, prints `obs` keys/shapes and `env.action_space` structure,
+       runs 5 random-action steps, prints `env.get_metrics()`. This is
+       your ONE exploration step.
+    2. Decide on an approach (heuristic / planner-based / imitation /
+       RL — see literature numbers above) and write `train.py` +
+       `predict.py`. Submit eval EARLY to measure runtime and confirm
+       the harness contract works end-to-end.
+    3. Inspect eval results, training curves, and elapsed time. Decide:
+       - Continue / extend the current approach if metrics are improving.
+       - Change approach (architecture, reward shaping, hparams) if not.
+    4. Iterate; submit best checkpoint before the time budget expires.
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall):
+    habitat-sim (0.3.3, headless EGL + Bullet), habitat-lab (0.3.3),
+    habitat-baselines (0.3.3), stable-baselines3 (2.4.1), sb3-contrib (2.4.0),
+    transformers, accelerate, einops, timm, wandb, tensorboard, torchvision (with
+    pre-cached ResNet-50 IMAGENET1K_V1 weights — no network needed).
+
+  CRITICAL RULES:
+  - ALWAYS `os.chdir('/opt/habitat-lab-src')` BEFORE `import habitat` in ANY
+    script. Habitat resolves "data/..." relative to cwd. Do NOT use
+    `os.chdir('/workspace')` — `/workspace` is read-only in eval container.
+  - You MUST use the real Habitat simulator. Do NOT mock the env.
+  - The environment is fully configured. The Quick-start example above is
+    tested — copy it verbatim, do NOT modify paths or add extra imports.
+  - Do NOT run broad file scans (`find /`, `ls -R /opt`, `du -sh`). All paths
+    are documented above.
+
+  PATH FOOTGUN (caused real failures — fix once in predict.py / train.py):
+  - `os.chdir('/opt/habitat-lab-src')` re-roots every later relative
+    `open()`. So `abspath()` CLI args BEFORE chdir, not after:
+        args.data_path  = os.path.abspath(args.data_path)
+        args.checkpoint = os.path.abspath(args.checkpoint)
+        args.output     = os.path.abspath(args.output)
+        os.chdir('/opt/habitat-lab-src');  import habitat
+  - `--checkpoint` is a DIRECTORY. Save/load by an explicit filename:
+        train.py:    torch.save(sd, os.path.join(save_dir, "model.pt"))
+        predict.py:  torch.load(os.path.join(args.ckpt, "model.pt"), map_location='cpu')
+  - Local self-test must pass absolute paths too:
+        python predict.py --data_path "$(pwd)/local_eval" \
+            --checkpoint "$(pwd)/checkpoints/baseline" --output "$(pwd)/out.json"
+  - This is a pure RL task — there's no test set. `--data_path` is just a
+    framework placeholder; ignore it and hardcode `split="val"`,
+    `num_episodes=50`, `seed=42` in predict.py.
+  - Network is DISABLED (`network_access: false`). Do NOT call
+    `pip install`, `wget`, `huggingface-cli download`, etc. Suppressing the
+    error with `; true` does NOT install the package — your import WILL fail
+    later. Use only the pre-installed packages.
+  - If you see repeated errors, STOP and fix immediately — do not retry blindly.
+
+  HABITAT CONFIG — TWO REQUIRED OVERRIDES, NO OTHERS:
+  - The default config requires modifying `simulator.scene_dataset` and
+    `dataset.scenes_dir` (see Quick-start). Without these two overrides the
+    env creation FAILS with `ESP_CHECK failed: ... semantic tag 'hssd_ssd_map'
+    not being found in SemanticAttributesManager`.
+  - The config is `OmegaConf` frozen. To set fields, wrap in `read_write`:
+        from habitat.config import read_write
+        with read_write(config):
+            config.habitat.simulator.scene_dataset = "..."
+            config.habitat.dataset.scenes_dir       = "..."
+  - Do NOT change anything else — sensors, action space, agents, max_steps
+    are all tuned for this task.
+
+  RENDERING — AVOID ASYNC:
+  - Do NOT use `habitat_baselines.rl.ppo.PPOTrainer` / `habitat_baselines.run`.
+    They use async rendering, which causes:
+        "ESP_CHECK failed: Renderer was not created with a background
+         render thread, cannot do async drawing".
+  - Use `habitat.Env` directly with synchronous `env.reset()` / `env.step()`,
+    as in the Quick-start example.
+
+  MULTI-AGENT ACTION FORMAT — common pitfall:
+  - This is a *2-agent* env. Single-action `{"action": "name", "action_args":
+    {...}}` will fail with `KeyError: agent_1_oracle_nav_randcoord_action`.
+  - Use the tuple form shown in Quick-start. Both agents must be addressed
+    every step (agent_1 just receives a trigger array; the oracle nav picks
+    the actual coords internally).
+
+  OBSERVATION SPACE — only use what your policy needs:
+  - The full obs dict has 14+ keys (see env yaml). For Spot's policy you only
+    need `agent_0_*` keys. Slicing the dict early keeps your network small
+    and training fast.
+  - `agent_0_humanoid_detector_sensor` is a binary "is human visible from
+    Spot's head_rgb POV". It depends on line-of-sight, so it can read 0
+    even when the human is geometrically close — treat it as a soft cue
+    (e.g. a reward bonus), not a hard control gate.
+  - `agent_0_goal_to_agent_gps_compass` is `[distance, angle]` to the human
+    in Spot's egocentric frame — the most informative non-visual signal.
+    `distance` is Euclidean metres, `angle` is in `[-pi, pi]`. The exact
+    sign of `angle` and the exact sign of `agent_0_base_vel[1]`
+    (turn-left vs turn-right) are NOT documented identically across the
+    config; before trusting any closed-loop yaw controller, run a brief
+    in-place rotation sanity check (forward = 0, turn = constant for ~30
+    steps) and verify which sign of `turn` actually drives `angle → 0`.
+    Skipping this check is a frequent source of silent zeros on this task.
+
+  REWARD SHAPING:
+  - In raw `habitat.Env` the cumulative shaped measurement
+    `env.get_metrics()["social_nav_reward"]` is the natural per-step
+    proxy when differenced across consecutive steps. The env's
+    `social_nav_reward` already includes a `facing_human_reward` and a
+    collision penalty (see `hssd_spot_human_social_nav.yaml`'s
+    `social_nav_reward:` block).
+  - If you add custom shaping, remember the success criterion is a JOINT
+    constraint: dist ∈ [1.0, 2.0) AND `|angle|` below the facing
+    threshold (see `social_nav_seek_success` config block) AND held for
+    `following_step_succ_threshold` accumulated steps. A single-term
+    distance bonus (e.g. `-dist`) will train the policy to sit on top of
+    the human and still score 0.
+
+  STEP BUDGET — sanity check before launching long jobs:
+  - One env step ≈ 30–50 ms. 1k steps ≈ 30–50 s. 100k steps ≈ 1 hour.
+    1 PPO update with 128 rollout × 4 envs ≈ 30 s.
+  - For a 10-hour budget, plan ~15–20M env steps total (across all training
+    runs in your iterations). H3 paper baselines used 100M+ env steps on
+    8 GPUs, so you will not reach paper-grade RL numbers — focus on a
+    working policy that beats random.
+  - Submit eval EARLY (after a minimal first iteration) so you measure
+    real harness/runtime before committing to a long training run.
+
+  ENV STARTUP WARNINGS — usually benign:
+  - "[Metadata] navmesh_instances ... not found on disk": references
+    `v3_sc4_*.navmesh` files unused by the social_rearrange episodes.
+    Ignore.
+  - "SpotHeadStereoDepthSensor ... no head_stereo_right_depth": habitat-sim's
+    own warning, returns zeros for the missing channel. Ignore.
+  - "EGL device 0 not found" once at startup: normal in some containers; if
+    env creation succeeds afterwards, ignore it.
+
+  KEY-NAME PITFALLS — match habitat-lab 0.3.3 exactly (NOT the H3 paper):
+  - Primary metric is `nav_seek_success` (not `social_nav_seek_success`).
+  - Distance success is `nav_to_pos_success` (not `nav_to_pos_succ`).
+  - Follow-step ratio is `follow_human_steps_ratio_after_frist_encounter`
+    (note habitat's typo "frist" — yes, really).
+  - There is NO `pddl_success` and NO `total_distance_to_human` at the top
+    level. Use `social_nav_stats["avg_robot_to_human_dis_over_epi"]` instead.
+  - These names are stable inside the image; do not "auto-correct" them.
+
+  Pre-cached models (no network needed):
+    - ResNet-50 (~98 MB) — `torchvision.models.resnet50(weights='IMAGENET1K_V1')`
+
+compute_type: gpu
+
+# Resource limits
+# budget-review 2026-04-27: H3 social-nav (multi-agent kinematic sim with depth
+# rendering); single-process PPO is feasible but slow. 4 GPUs lets the agent
+# split env workers across devices for VectorEnv-style throughput.
+max_gpu_count: 4
+total_time_budget_hours: 10
+max_iterations: 30
+network_access: false
+
+# Paths (mirrors bigcodebench_codegen / aime_math_rl convention)
+script_dir: script/
+data_dir: /rab_data/habitat3/
+test_data_dir: /rab_data/habitat3_test/
+docker_image: farbench/farbench:habitat3-cu118
+
+# Evaluation
+primary_metric: nav_seek_success
+higher_is_better: true
+evaluator_class: benchmarks.habitat3.script.evaluator.HabitatSocialNavEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>"
+  input_format: "data_path contains only placeholder eval_config.json; predict.py should hardcode split=val, num_episodes=50, seed=42"
+  output_format: '{"primary_metric": "nav_seek_success", "nav_seek_success": 0.42, "social_nav_reward": -3.1, "found_human_rate_over_epi": 0.55, "safe_follow_steps": 520, "avg_robot_to_human_dis_over_epi": 1.85, "nav_to_pos_success": 0.30, "per_episode": [...], "total_episodes": 50}'

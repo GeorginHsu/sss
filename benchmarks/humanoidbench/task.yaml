@@ -1,0 +1,472 @@
+name: humanoidbench
+domain: robotics
+subdomain: Humanoid Control
+description: |
+  Train an online RL policy on 10 representative HumanoidBench tasks and maximise
+  `success_rate` averaged over held-out evaluation episodes.
+
+  HumanoidBench (https://humanoid-bench.github.io/) provides 27 whole-body
+  humanoid control tasks with the Unitree H1 robot (plus Shadow Hands for
+  manipulation), simulated in MuJoCo. We select a diverse subset of 10 tasks
+  covering locomotion, balance and manipulation so the agent must learn
+  transferable skills, not overfit a single task.
+
+  ## Goal
+
+  Maximise the overall `success_rate` across the 10 evaluation tasks,
+  each rolled out for a fixed set of episodes with deterministic seeds
+  (see `eval_config.json`).
+
+  ## Evaluation tasks (10)
+
+  All 10 use the **`h1hand`** robot (Unitree H1 19-dof body + 2x Shadow Hand
+  21-dof each). action_space is identical across all 10 tasks:
+  **Box(-1, 1, (61,), float32)** — so a single multi-task policy can output
+  one 61-D action vector for every task. observation_space differs per task:
+
+  | task_id                       | obs_dim | max_steps | success_bar | info["success"]? |
+  |-------------------------------|--------:|----------:|------------:|:----------------:|
+  | h1hand-walk-v0                |     151 |      1000 |         700 |        no        |
+  | h1hand-stand-v0               |     151 |      1000 |         800 |        no        |
+  | h1hand-run-v0                 |     151 |      1000 |         700 |        no        |
+  | h1hand-sit_simple-v0          |     151 |      1000 |         750 |        no        |
+  | h1hand-balance_simple-v0      |     164 |      1000 |         800 |        no        |
+  | h1hand-reach-v0               |     157 |      1000 |       12000 |        no        |
+  | h1hand-push-v0                |     163 |       500 |         700 |        YES       |
+  | h1hand-pole-v0                |     151 |      1000 |         700 |        no        |
+  | h1hand-door-v0                |     155 |      1000 |         600 |        no        |
+  | h1hand-package-v0             |     173 |      1000 |        1500 |        YES       |
+
+  These numbers are not paper-quoted — they were measured live inside this
+  image (see Dockerfile sanity check). They are the **single source of
+  truth** for action_space, observation_space, episode length, and success
+  threshold; the same table is also baked into eval_config.json so
+  predict.py can read it programmatically.
+
+  ## Success definition (READ THIS — agents commonly get it wrong)
+
+  Official HumanoidBench protocol: **`episode_success = (sum(rewards) >=
+  task.success_bar)`**. The `success_bar` per task is in the table above and
+  in `eval_config.json`. Only `h1hand-push-v0` and `h1hand-package-v0`
+  ALSO emit `info["success"]` from `env.step()`; for the OTHER 8 tasks
+  there is NO `success` key in `info`, so `info.get("success", 0)` returns
+  0 forever and your `success_rate` will silently be 0/200.
+
+  predict.py MUST:
+    - sum the per-step reward into `episode_total_reward`, and
+    - emit it as `per_episode[i]["reward"]` (the framework name).
+  The evaluator then recomputes `success = (reward >= success_bar)` server
+  side using the bars in `eval_config.json`. predict.py MAY also report a
+  per-episode `success` field; the evaluator ignores it when `reward` and
+  `success_bar` are both available (i.e. server-side recomputation wins).
+
+  ## Pre-installed environment
+
+  Everything is ready inside the container:
+    - MuJoCo >= 3.1 (no manual activation key needed)
+    - humanoid-bench repo at /opt/humanoid-bench (pip installed in editable mode)
+    - dm_control, gymnasium
+    - PyTorch, stable-baselines3, tensorboard
+    - Registered Gymnasium ids: `h1hand-<task>-v0` (61-dim action, the 10
+      eval tasks use this). `h1-<task>-v0` (no-hand variant, 19-dim action)
+      is ALSO registered but is NOT in the eval set — training on the no-hand
+      variant and submitting it as `h1hand-walk-v0` will fail with
+      `ValueError: Cannot feed value of shape (19,) for Tensor of shape (61,)`.
+
+  ## Training
+
+  Training is fully ONLINE RL (no static dataset). The agent creates
+  Gymnasium envs and interacts with the MuJoCo simulator.
+
+      import gymnasium as gym
+      import humanoid_bench  # registers the envs
+      env = gym.make("h1hand-walk-v0")
+      obs, info = env.reset(seed=0)
+      for _ in range(1000):
+          action = env.action_space.sample()   # replace with policy
+          obs, reward, terminated, truncated, info = env.step(action)
+          if terminated or truncated:
+              break
+      success = float(info.get("success", 0.0))
+
+  You MAY train on any subset of the 10 eval tasks, or on a multi-task
+  policy that covers all 10. Training data = your own rollouts.
+
+  ## Predict script contract
+
+  You MUST create `predict.py` in /workspace that:
+    1. Loads your trained policy from `--checkpoint` directory.
+    2. Reads the eval protocol from `<data_path>/eval_config.json` which
+       specifies the list of tasks and, per task: `obs_dim`, `success_bar`,
+       `max_episode_steps`, `info_has_success`, `episodes`, `seeds`.
+    3. For each (task, episode) pair, rolls out the policy in the real
+       HumanoidBench environment, sums per-step rewards into
+       `episode_total_reward`, and records that as the per-episode `reward`.
+    4. Writes a JSON results file to `--output`.
+
+  Invocation:
+    python predict.py --data_path <data_path> --checkpoint <ckpt_dir> --output <output.json>
+
+  Required output format (the evaluator recomputes success_rate server side
+  from `per_episode` using the success_bar in eval_config.json — `reward`
+  here means episode-total cumulative reward, NOT mean step reward):
+
+    {
+      "total_episodes": 200,
+      "per_episode": [
+        {"task_id": "h1hand-walk-v0", "episode_id": 0, "seed": 0, "reward": 355.2},
+        ...
+      ]
+    }
+
+  Optional but useful (the evaluator ignores them when present, but they
+  show up in the metrics dict for debugging):
+    {
+      "success_rate": 0.42,
+      "mean_reward":  120.3,
+      "per_task":     {"h1hand-walk-v0": {"success_rate": 0.8, "mean_reward": 350.1, "n_episodes": 20}, ...},
+      "per_episode":  [{... "success": 1, ...}, ...]
+    }
+
+  Whatever you report at the top level is REPLACED by the evaluator's
+  recomputation from `per_episode` × `success_bar`. So the *only* thing you
+  must get right is `per_episode[i]["reward"]` (cumulative episode reward).
+
+  ## Execution priority
+
+  - Start with a very short test script (<= 20 lines): `gym.make("h1hand-walk-v0")`,
+    reset, 5 random steps, print obs shape / reward / info keys. Only one short
+    exploration step — do NOT spend iterations debugging MuJoCo / GPU / paths.
+  - Pick ONE task first (e.g. `h1hand-walk-v0`), train a minimal PPO/SAC baseline,
+    submit eval. Iterate on reward shaping / hyperparams.
+  - Then scale to multi-task training covering all 10.
+  - Each env.step() is cheap compared to Habitat (~1–3 ms), so you can afford
+    a few million env steps per task within the time budget.
+
+  ## Constraints
+
+  - Policy parameter count <= 100M (keep it tractable; HumanoidBench policies
+    are typically < 5M).
+  - Network access: false.
+  - Training data = your own online rollouts. No external humanoid datasets.
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall):
+    - mujoco, dm_control, gymnasium
+    - humanoid-bench (installed from /opt/humanoid-bench)
+    - stable-baselines3, sb3-contrib, tensorboard
+
+  CRITICAL RULES:
+  - You MUST use the real HumanoidBench / MuJoCo env for training. Do NOT
+    create a mock / simplified env — the evaluator rolls your policy out in
+    the real env and any policy trained elsewhere will score ~0.
+  - Use the env id `h1hand-<task>-v0` EXACTLY (with `hand`, not `h1-<task>-v0`).
+    The 10 eval tasks are fixed in eval_config.json — do NOT change that file
+    AND do NOT train on the no-hand `h1-walk-v0` (those have 19-dim action
+    space, the eval h1hand variants have **61-dim action space**; the policy
+    WILL fail to load).
+  - Success comes from `episode_total_reward >= success_bar`, NOT
+    `info["success"]` — only push/package emit info["success"]. Read
+    success_bar from eval_config.json and threshold cumulative episode
+    rewards. (See "Success definition" in the task description.)
+  - **NEVER write `Monitor(env, info_keywords=("success",))` for tasks
+    where `info_has_success=False` in eval_config.json**. SB3's Monitor
+    does an unconditional `info["success"]` lookup on every step → for
+    walk/stand/run/sit_simple/balance_simple/reach/pole/door this throws
+    `KeyError: 'success'` immediately, train.py dies, no checkpoint, every
+    iteration scores 0. Either gate on `info_has_success`, pick a different
+    info key, or omit `info_keywords` entirely (the evaluator recomputes
+    success from cumulative reward anyway). See common pitfall #2 below.
+  - Run training from /workspace. Checkpoints go under /workspace/ckpt/ .
+  - For headless rendering set MUJOCO_GL=egl (already set by the image).
+  - If training diverges or your per-task `mean_reward` stays orders of
+    magnitude below `success_bar` after 100k env steps, STOP and try
+    different reward shaping / architecture instead of throwing compute at it.
+
+  ## predict.py minimal template (READ — copy and adapt, don't write from
+  ## scratch on iteration 1)
+
+  Most agents that fail this task fail in predict.py boilerplate, not in
+  the policy itself. Two non-obvious things to get right:
+
+    A) For 8 of 10 tasks `info["success"]` does NOT exist. Use the
+       `success_bar` from eval_config.json and threshold the *cumulative*
+       episode reward instead. (See the per-task table in `description`.)
+    B) Per-episode `reward` reported here MUST be the SUM over the episode,
+       not the mean step reward. The evaluator recomputes
+       `success = (reward >= success_bar)`.
+
+  Skeleton (read-only `cfg["tasks"]`, every field is already there):
+
+      # /workspace/predict.py
+      import argparse, json, os, gymnasium as gym
+      import humanoid_bench  # noqa: F401 — registers h1hand-*-v0 (and h1-*-v0) ids
+      from stable_baselines3 import PPO          # or SAC
+
+      ap = argparse.ArgumentParser()
+      ap.add_argument("--data_path",  required=True)   # /data in the eval container
+      ap.add_argument("--checkpoint", required=True)   # /workspace/ckpt/<...>
+      ap.add_argument("--output",     required=True)
+      args = ap.parse_args()
+
+      with open(os.path.join(args.data_path, "eval_config.json")) as f:
+          cfg = json.load(f)
+
+      # SB3 saves a .zip; pass the path with or without the .zip suffix.
+      # If you trained per-task models, defer loading into the loop.
+      model = PPO.load(args.checkpoint)
+
+      per_episode = []
+      for task_spec in cfg["tasks"]:
+          task_id      = task_spec["task_id"]
+          max_steps    = int(task_spec["max_episode_steps"])
+          success_bar  = float(task_spec["success_bar"])
+          info_has_succ = bool(task_spec.get("info_has_success", False))
+
+          for ep_idx, seed in enumerate(task_spec["seeds"]):
+              env = gym.make(task_id)
+              obs, _info_reset = env.reset(seed=int(seed))   # info_reset is {}
+              ep_reward = 0.0
+              ep_info_success = 0  # only meaningful when info_has_succ is True
+              for step in range(max_steps):
+                  # deterministic=True is REQUIRED — sampling adds 10-20%
+                  # variance on the same seed and breaks reproducibility.
+                  action, _ = model.predict(obs, deterministic=True)
+                  obs, reward, terminated, truncated, info = env.step(action)
+                  ep_reward += float(reward)
+                  if info_has_succ and int(info.get("success", 0)) > 0:
+                      ep_info_success = 1
+                  if terminated or truncated:
+                      break
+              env.close()
+
+              # Ground-truth success per HumanoidBench paper:
+              ep_success = int(ep_reward >= success_bar)
+              # If push/package's info["success"] ever fired, OR-merge it
+              # (paper marks the episode as success if it ever reached the
+              # success state, even if reward < bar due to early termination).
+              if info_has_succ:
+                  ep_success = max(ep_success, ep_info_success)
+
+              per_episode.append({
+                  "task_id":    task_id,
+                  "episode_id": ep_idx,
+                  "seed":       int(seed),
+                  "reward":     round(ep_reward, 4),    # <-- CUMULATIVE episode reward
+                  "success":    ep_success,             # optional; evaluator recomputes
+              })
+
+      # Aggregates are recomputed by the evaluator; writing them here just
+      # keeps the JSON human-readable.
+      from collections import defaultdict
+      tk_n, tk_s, tk_r = defaultdict(int), defaultdict(int), defaultdict(float)
+      for ep in per_episode:
+          tk_n[ep["task_id"]] += 1
+          tk_s[ep["task_id"]] += ep["success"]
+          tk_r[ep["task_id"]] += ep["reward"]
+      per_task = {t: {"success_rate": tk_s[t] / tk_n[t],
+                      "mean_reward":  tk_r[t] / tk_n[t],
+                      "n_episodes":   tk_n[t]} for t in tk_n}
+
+      results = {
+          "success_rate":  sum(e["success"] for e in per_episode) / max(len(per_episode), 1),
+          "mean_reward":   sum(e["reward"]  for e in per_episode) / max(len(per_episode), 1),
+          "total_episodes": len(per_episode),
+          "per_task":      per_task,
+          "per_episode":   per_episode,
+      }
+      with open(args.output, "w") as f:
+          json.dump(results, f)
+
+  ## Common pitfalls (READ BEFORE FIRST ITERATION — these all happen on
+  ## "iteration 1" of new agents)
+
+  1. Gymnasium API split (5-tuple vs 4-tuple):
+     gymnasium >= 0.26 returns FIVE values from env.step():
+         obs, reward, terminated, truncated, info = env.step(action)
+                                  ^^^^^^^^^^  ^^^^^^^^^
+     Old gym (the deprecated package, NOT gymnasium) returned FOUR:
+         obs, reward, done, info = env.step(action)
+     If you wrote training code against the old API you'll see:
+         ValueError: too many values to unpack (expected 4)
+                                or
+         AttributeError: 'tuple' object has no attribute 'astype'
+     Likewise env.reset() returns (obs, info) — TWO values. SB3 2.x
+     handles both APIs internally, but YOUR predict.py / custom callbacks
+     must use the 5-tuple form.
+
+  2. **CRITICAL FOOTGUN — `Monitor(env, info_keywords=("success",))`**:
+     Only `h1hand-push-v0` and `h1hand-package-v0` populate `info["success"]`.
+     For the OTHER 8 tasks (walk/stand/run/sit_simple/balance_simple/reach/
+     pole/door) `info` does NOT contain `"success"`, and SB3's Monitor
+     does an UNCONDITIONAL `info[key]` lookup on every step, so this:
+
+         from stable_baselines3.common.monitor import Monitor
+         env = Monitor(env, info_keywords=("success",))     # ← KILLS 8/10 tasks
+
+     crashes IMMEDIATELY on the first step with `KeyError: 'success'` →
+     train.py never saves a checkpoint → predict.py PPO.load() fails →
+     the entire iteration scores 0. (This is the most common HumanoidBench
+     bug — at least one full FARBench run wasted 21 iterations on it.)
+
+     Three correct options:
+
+       (a) Drop `info_keywords` for tasks where `info_has_success=False`
+           and rely on `episode_total_reward >= success_bar` instead:
+
+             from stable_baselines3.common.monitor import Monitor
+             info_keys = ("success",) if task_spec["info_has_success"] else ()
+             env = Monitor(env, info_keywords=info_keys)
+             # then in your callback:
+             #   ep_info = model.ep_info_buffer[-1]
+             #   if "success" in ep_info:        # push / package
+             #       success = ep_info["success"]
+             #   else:                            # 8 reward-bar tasks
+             #       success = float(ep_info["r"] >= success_bar)
+
+       (b) Use a richer info key the task actually emits — every locomotion
+           task has `stand_reward`, `upright`, `small_control` etc.:
+
+             info_keywords=("stand_reward", "upright")    # walk/stand/run/...
+
+           These are FLOATS in [0, 1], so set `info_keywords` to whatever
+           the env actually has (consult `info_keys_after_step` in
+           dataset_info.json). DO NOT pass a key that may be missing on
+           ANY step — that's how you get the KeyError.
+
+       (c) Just don't track success during training at all — the evaluator
+           recomputes it from `episode_total_reward >= success_bar`. You'll
+           still see the episode reward (`r`) in `ep_info_buffer`, which is
+           sufficient signal for early-stopping. This is the safest default
+           if you don't want to special-case push/package.
+
+  3. predict.py MUST use deterministic=True for action selection.
+     PPO/SAC default `predict()` samples from the action distribution,
+     which adds ~10-20 % variance on the same seed → eval becomes noisy
+     and your reported success_rate disagrees with the evaluator's
+     recomputation. Always:
+         action, _ = model.predict(obs, deterministic=True)
+
+  4. SubprocVecEnv + MuJoCo EGL + fork = silent corruption.
+     `make_vec_env(..., vec_env_cls=SubprocVecEnv)` defaults to fork on
+     Linux. EGL contexts opened in the parent before fork are NOT valid
+     in children → workers either return all-zero observations OR die
+     with `mujoco.FatalError: gladLoadGL error`. Two fixes:
+       (a) DO NOT touch any MuJoCo/EGL code in the parent before
+           creating the SubprocVecEnv (no env.render(), no gym.make()
+           outside the env_fn closure).
+       (b) Force spawn:
+             import multiprocessing as mp
+             mp.set_start_method("spawn", force=True)   # at import time
+           (Slightly higher startup cost, much more robust.)
+     For pure CPU-bound rollouts a DummyVecEnv (single-process) often
+     gives the best wall-clock if your policy is small (humanoidbench
+     policies are < 5M params).
+
+  5. SB3 checkpoint format: model.save(path) writes a .zip, NOT a
+     PyTorch state_dict. Loading uses the algorithm class:
+         model.save("/workspace/ckpt/walk")          # writes walk.zip
+         model = PPO.load("/workspace/ckpt/walk")    # or SAC.load(...)
+     Trying `torch.save(model.state_dict(), ...)` writes ONLY the policy
+     weights — the optimizer state, replay buffer, normalization stats
+     all get lost. predict.py won't be able to reconstruct the policy
+     without the algorithm class anyway. Use SB3's save/load.
+
+  6. wandb / huggingface_hub: network is DISABLED. wandb.init() will
+     hang for 30 s then crash. Use offline mode:
+         import os; os.environ["WANDB_MODE"] = "offline"
+         import wandb; wandb.init(project="hb", mode="offline")
+     tensorboard logs (`logger="tensorboard"` in SB3) work fine — they
+     write to disk only.
+
+  7. `max_episode_steps` in eval_config.json is the EVAL truncation; it
+     is the SAME value humanoid-bench uses to register the env (1000 for
+     most tasks, 500 for `h1hand-push-v0`). predict.py enforces the cap
+     explicitly with `for step in range(max_steps): ... if terminated or
+     truncated: break` (see the template above) so a buggy gym wrapper
+     can't run forever. NOTE the field name: the file uses
+     `max_episode_steps`, NOT `max_steps_per_episode` — older snippets
+     in agent training data may have the latter; reading the wrong key
+     gives `KeyError` (or a silent default of 0 → zero-step episodes →
+     reward 0 → success 0).
+
+  8. obs_space / action_space MUST match between training and eval.
+     action_space is **identical across all 10 h1hand tasks**:
+         Box(-1, 1, (61,), float32)   # 19 H1 body + 2x21 Shadow Hand actuators
+     so a single multi-task policy works at the action side. The 29-dim
+     number you may have seen in older docs/papers is wrong for the H1+hand
+     variant — measured live in this image, every h1hand-*-v0 task reports
+     env.action_space.shape == (61,).
+
+     observation_space differs per task (manipulation tasks append object
+     state). Measured inside this image (single source of truth in
+     eval_config.json):
+         h1hand-walk-v0           : (151,)
+         h1hand-stand-v0          : (151,)
+         h1hand-run-v0            : (151,)
+         h1hand-sit_simple-v0     : (151,)
+         h1hand-balance_simple-v0 : (164,)
+         h1hand-reach-v0          : (157,)
+         h1hand-push-v0           : (163,)
+         h1hand-pole-v0           : (151,)
+         h1hand-door-v0           : (155,)
+         h1hand-package-v0        : (173,)
+     Box(-inf, inf, (D,), float64) — DO normalize before feeding an MLP
+     (e.g. SB3 VecNormalize, or running-mean/std).
+
+     If you train a single MLP on h1hand-walk-v0 (151) and try to load it
+     on h1hand-push-v0 (163) you'll get:
+         ValueError: Cannot feed value of shape (163,) for Tensor of shape (151,)
+     Two correct strategies:
+       (a) Per-task models: 10 independent PPO/SAC ckpts under
+           /workspace/ckpt/<task_id>/. Simple, no padding, ~10x training time.
+       (b) Multi-task policy with obs padding: pad every obs to max_dim=173
+           and add a task_id one-hot. One model, one ckpt.
+     Clip your policy's output to env.action_space [-1, 1] — PPO/SAC can
+     emit anything, but the actuators saturate / fail silently.
+
+  9. Time budget reality check:
+     Each MuJoCo env step ~1-3 ms on CPU. With 64 parallel SubprocVecEnv
+     workers (cap is 64 cores), wall-clock for 1 M env steps per task ≈
+        1e6 / 64 / 500 steps_per_sec ≈ 30 s
+     So 10 tasks × 1 M steps ≈ 5 min of pure rollout. Total wall clock
+     is dominated by gradient updates (PPO is on-policy, n_steps × n_envs
+     gradients per epoch) and eval rollouts (200 episodes × ~20 s each
+     in deterministic eval ≈ 70 min single-threaded — parallelize eval
+     too if you can). Budget ~7 h for training, 1-2 h for eval, 1 h
+     buffer for re-runs.
+
+compute_type: gpu
+# Online RL on the Unitree H1 humanoid: SubprocVecEnv worker count is the
+# real bottleneck (each MuJoCo env step is ~1-3 ms on CPU, GPU forward of
+# the small MLP policy is essentially free). With the policy capped at 100M
+# params (see max_model_params_billion below) SB3 PPO uses well under 1 GB
+# on a 32 GB card — a single GPU is more than enough. CPU cores and RAM
+# matter much more than GPU count: keep them generous so the agent can run
+# 64-128 parallel MuJoCo workers.
+max_gpu_count: 1
+max_cpu_cores: 64
+max_memory_gb: 128
+per_gpu_memory_gb: 48
+total_time_budget_hours: 10
+max_iterations: 30
+network_access: false
+# Top-level cap so the framework's model-size validator actually enforces
+# the "Policy <= 100M params" rule (description-only constraints are not
+# checked). 0.1B = 100M params; HumanoidBench papers typically use <5M.
+max_model_params_billion: 0.1
+
+script_dir: script/
+data_dir: /rab_data/humanoidbench/
+test_data_dir: /rab_data/humanoidbench_test/
+docker_image: farbench/farbench:humanoidbench-cu118
+
+primary_metric: success_rate
+higher_is_better: true
+evaluator_class: benchmarks.humanoidbench.script.evaluator.HumanoidBenchEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>"
+  input_format: "test_data_dir/eval_config.json lists 10 tasks; per task: obs_dim, action_dim (top-level=61, identical), max_episode_steps, success_bar, info_has_success, episodes (=20), seeds (0..19)."
+  output_format: '{"total_episodes": int, "per_episode": [{"task_id": str, "episode_id": int, "seed": int, "reward": float (CUMULATIVE episode reward), "success": 0|1 (optional, recomputed server-side as reward >= success_bar)}, ...]}'

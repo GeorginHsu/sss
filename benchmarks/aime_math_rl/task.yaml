@@ -1,0 +1,290 @@
+name: aime_math_rl
+domain: natural language processing
+subdomain: Math Reasoning
+description: |
+  Use reinforcement learning to fine-tune an LLM for AIME-style math reasoning.
+  Maximize exact-match accuracy on AIME 2024 + 2025 (60 competition problems).
+
+  Training source is `Skywork/Skywork-OR1-RL-Data` (math split, ~105K
+  verifiable problems, de-contaminated against AIME 2024/2025).
+
+  ## Data Format
+
+  Training data at $FARBENCH_DATA_DIR (/data in container):
+    - train.jsonl           (~100K rows from Skywork-OR1 math)
+    - val.jsonl             (~5K deterministic holdout)
+    - sample_train.jsonl    (256-row debug subset)
+    - dataset_info.json
+
+  The Qwen3-4B base model is NOT in /data. It is pre-cached in the image's
+  Hugging Face cache and loaded by the canonical id `Qwen/Qwen3-4B` (no
+  network required, see "Base model" section below).
+
+  Train row schema: {id, problem, expected_answer, data_source, messages,
+  difficulty, raw_ground_truth}. `difficulty` is the Skywork 7B-proxy score
+  in [0, 16] (higher = harder; chosen because Qwen3-4B is the base model).
+
+  Test data at $FARBENCH_TEST_DATA_DIR:
+    - test.jsonl          (60 rows: AIME24 + AIME25, fields: id, problem, year)
+    - test_answers.json   (hidden, evaluator only)
+
+  All AIME answers are integers in [0, 999].
+
+  ## Predict Script Contract
+
+  Create `predict.py`:
+    python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>
+
+  Output JSON: {"predictions": [{"id": "aime24-...", "answer": "123"}, ...]}
+  The evaluator tolerates `\boxed{...}`, surrounding text, and zero-padding.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/aime_math_rl/
+test_data_dir: /rab_data/aime_math_rl_test/
+docker_image: farbench/farbench:aime_math_rl-cu118
+
+# Evaluation
+primary_metric: exact_match
+higher_is_better: true
+evaluator_class: benchmarks.aime_math_rl.script.evaluator.AimeMathRLEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  # predict.py runs under /opt/vllm's interpreter (via the vllm-python wrapper)
+  # so `from vllm import LLM` works out of the box. The framework reads this
+  # `interpreter` field in farbench/eval_harness.py; default would be sys.executable.
+  interpreter: /usr/local/bin/vllm-python
+  invocation: "vllm-python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>"
+  input_format: "test.jsonl with rows {id, problem, year}"
+  output_format: '{"predictions": [{"id": "aime24-...", "answer": "123"}, ...]}'
+
+# Constraints
+# budget-review 2026-04-20: RL on Qwen3-4B with Skywork-OR1 math (~105K) + AIME 24/25 eval.
+# Hardware: 4x RTX 6000 Ada (sm_89, 48 GB/GPU, 192 GB aggregate). cu118 image.
+# LoRA/QLoRA on 4 GPUs, ~1 RL epoch on a filtered subset fits in 10h. Full
+# fine-tune of 4B is feasible (FSDP, ~36-40 GB/GPU peak) but slower; LoRA is
+# the recommended starting point.
+max_gpu_count: 4
+per_gpu_memory_gb: 48      # RTX 6000 Ada = 49140 MiB; report 48 GB in agent prompt
+max_cpu_cores: 64          # host has 144 logical cores; 64 per task lets two run in parallel
+max_memory_gb: 256         # host has 1.8 TiB; 256 GB headroom for vLLM + dataloader + RL rollouts
+total_time_budget_hours: 20
+max_iterations: 30
+network_access: false
+# Qwen3-4B base (~4.0B) + optional LoRA adapter; leave headroom for merged ckpts.
+max_model_params_billion: 5.0
+
+agent_hints: |
+  ## Hardware (this run)
+  4x RTX 6000 Ada (sm_89, 48 GB/GPU, 192 GB aggregate VRAM). cu118 image.
+  Host also provides 64 CPU cores and 256 GB RAM to the container — feel
+  free to crank DataLoader `num_workers`, preprocessing threads, or vLLM
+  worker counts; memory is not the bottleneck here.
+
+  ## Two Python environments coexist in this image -- READ CAREFULLY
+
+  1. TRAINING env (default `python`, /usr/bin/python):
+       torch 2.7.1+cu118 · transformers >= 4.51 · peft · trl · bitsandbytes
+       · accelerate · datasets · sympy · jsonlines · huggingface_hub
+       Use this for: train.py, RL rollout if you implement it via HF's
+       `model.generate`, data preprocessing, LoRA merging, anything that
+       touches peft / trl / bitsandbytes.
+
+  2. INFERENCE env (`/usr/local/bin/vllm-python`, isolated /opt/vllm venv):
+       torch 2.10+cu128 · transformers 5.7+ · vllm 0.19.1
+       Has: vllm, transformers, tokenizers, safetensors, numpy.
+       Does NOT have: peft, trl, bitsandbytes, accelerate.
+
+  predict.py contract -- the framework calls predict.py via `vllm-python`
+  automatically (eval_contract.interpreter), so just write:
+
+      # /workspace/predict.py
+      from vllm import LLM, SamplingParams
+      llm = LLM(model="/workspace/ckpt_merged",
+                tensor_parallel_size=4, dtype="bfloat16",
+                max_model_len=40960, gpu_memory_utilization=0.85)
+      sp  = SamplingParams(temperature=0.6, top_p=0.95, top_k=20,
+                           max_tokens=38000)
+      outs = llm.generate(prompts, sp)
+      # ... extract \boxed{...}, write {"predictions": [...]} to args.output
+
+  KEY CONSEQUENCE for LoRA users:
+    Because predict.py runs in a venv WITHOUT peft, you cannot
+    `PeftModel.from_pretrained(adapter)` inside predict.py. Two options:
+      (A) After training, merge the LoRA into the base weights and save
+          the merged model:
+            merged = peft_model.merge_and_unload()
+            merged.save_pretrained("/workspace/ckpt_merged")
+          Then point vLLM at /workspace/ckpt_merged. (Recommended.)
+      (B) Use vLLM's native LoRA adapter support:
+            llm = LLM(model="Qwen/Qwen3-4B", enable_lora=True,
+                      max_lora_rank=64)
+            outs = llm.generate(prompts, sp,
+                                lora_request=LoRARequest("a", 1,
+                                "/workspace/lora_adapter"))
+
+  If you want vLLM during RL training to do fast rollouts from the trainer
+  process, call it via subprocess (because the trainer env has no vllm):
+      subprocess.run(["/usr/local/bin/vllm-python", "rollout.py", ...])
+  Or run a vllm OpenAI-compatible server in a sidecar shell:
+      /usr/local/bin/vllm-python -m vllm.entrypoints.openai.api_server \
+          --model Qwen/Qwen3-4B --tensor-parallel-size 2 --port 8000
+  and have the trainer hit http://127.0.0.1:8000/v1/completions.
+
+  ## Base model (offline, no download)
+  Base model: `Qwen/Qwen3-4B` (4.0B params, supports thinking mode).
+  PRE-CACHED at Docker build time in the system HF cache
+  (/root/.cache/huggingface/hub/), shared by both the training env and the
+  inference venv. Load via the canonical HF id, NOT a filesystem path:
+    AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
+    AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-4B",
+        torch_dtype="auto", device_map="auto")
+    LLM(model="Qwen/Qwen3-4B", ...)              # vllm-python
+  No network needed; transformers / vllm both find the cached copy
+  automatically. DO NOT search /data/base_model/ — that directory does not
+  exist in this image.
+
+  ## Qwen3-4B specifics for AIME math
+    - Use the chat template with `enable_thinking=True` (default). The model
+      emits a `<think>...</think>` block before the final answer; strip it
+      before returning the integer to predict.py.
+    - Official thinking-mode sampling: temperature=0.6, top_p=0.95, top_k=20,
+      min_p=0. DO NOT use greedy decoding (causes loops).
+    - Append "Please reason step by step, and put your final answer within
+      \boxed{}." to user prompts, then regex the last \boxed{...}.
+    - 32K native context; up to ~38K output tokens for hardest problems.
+      vLLM with max_model_len=40960 fits comfortably on 4x48 GB.
+
+  ## Memory / parallelism guidance on 4x 48 GB
+    - LoRA r=16 on 4B fits in ~14-18 GB/GPU; allows batch_size 8-16 per
+      device with seq_len 4096.
+    - QLoRA r=32 (4-bit NF4 base via bitsandbytes 0.45.5) fits in
+      ~10-12 GB/GPU.
+    - Full fine-tune with FSDP FULL_SHARD + bf16 + AdamW32 + grad-ckpt:
+      peak ~36-40 GB/GPU on Qwen3-4B with seq_len 2048. Feasible but
+      slower than LoRA; prefer LoRA unless LoRA hits a clear ceiling.
+    - Always launch multi-GPU training as `torchrun --nproc_per_node=4 ...`
+      or `accelerate launch --num_processes 4 ...`; `python train.py` will
+      silently fall back to nn.DataParallel and break with newer transformers
+      (RuntimeError: chunk expects at least a 1-dimensional tensor).
+
+  ## RL rollout speed (this is the bottleneck on AIME)
+  Each Qwen3-4B trajectory can be ~5-30K output tokens (thinking mode is
+  verbose). HF `model.generate()` in a Python loop is far too slow for RL.
+  Recommended:
+    - Run vLLM (via vllm-python subprocess or an OpenAI-API sidecar, see
+      above) on 1-2 dedicated GPUs for rollout, leaving 2-3 GPUs to the
+      LoRA trainer. vLLM's PagedAttention + continuous batching is 5-10x
+      faster than HF generate at long contexts.
+    - Cap `max_new_tokens` (e.g. 4096-8192 for early RL iterations, raise
+      to 38000 only for the final eval) and early-stop on first
+      `\boxed{...}` detection to save compute on easy problems.
+
+  ## Suggested workflow
+    1) Filter train.jsonl by `difficulty` (0-16 scale, already computed as
+       the 7B proxy for 4B); drop rows with value 0 (trivial) or 16
+       (unsolvable) to keep RL gradients informative.
+    2) Verify the prompt -> generate -> extract -> reward pipeline on
+       sample_train.jsonl (256 rows) before launching full RL.
+    3) Start with LoRA r=16; only switch to higher rank or full FT if you
+       see a clear ceiling and still have time budget left.
+    4) Use val.jsonl (5K) for iteration / reward calibration; reserve
+       AIME24/25 (60 problems) for the final predict.py run only.
+    5) Before eval, merge LoRA into the base weights and save under
+       /workspace/ckpt_merged/ so vLLM in predict.py can load it directly.
+
+  ## Time budget rough split (10h total, 4x 48 GB Ada)
+    - Data filtering + sanity smoke           :  ~0.5h
+    - LoRA r=16 RL on ~30K filtered + vLLM   :  ~5-6h on 4 GPUs (2 train + 2 rollout)
+    - Eval (60 AIME problems via vLLM tp=4)  :  ~0.1h per try, run 2-3 times
+    - Buffer for re-runs / debug              :  ~2-3h
+
+  Primary metric is exact-match on 60 AIME problems. Long thinking traces
+  only matter if they yield the correct final integer.
+
+  ## Common pitfalls (READ BEFORE FIRST ITERATION)
+
+  1. LoRA / QLoRA + `gradient_checkpointing=True` requires ONE extra line,
+     or autograd will report:
+         RuntimeError: element 0 of tensors does not require grad and does
+                       not have a grad_fn
+     Reason: gradient checkpointing re-runs the forward pass inside a
+     `torch.no_grad()` block, so the residual/embedding activations that
+     feed the LoRA adapters arrive without `requires_grad=True`. The LoRA
+     output then has no grad_fn and backward() dies.
+     Fix: call this right after loading the base model, BEFORE wrapping
+     with peft's `get_peft_model`:
+         model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-4B", ...)
+         model.gradient_checkpointing_enable()      # or TrainingArguments(...)
+         model.enable_input_require_grads()         # <── THE MISSING LINE
+         model = get_peft_model(model, lora_config)
+     Equivalent for QLoRA: `prepare_model_for_kbit_training(model)` already
+     calls `enable_input_require_grads()` internally, so as long as you use
+     that helper you're fine. If you skip `prepare_model_for_kbit_training`
+     you must call `enable_input_require_grads()` manually.
+
+  2. Custom `TrainerCallback` MUST subclass `transformers.TrainerCallback`.
+     Writing `class MetricsLoggerCallback:` (without the base class) compiles
+     fine but the Trainer's `CallbackHandler.call_event(...)` invokes
+     `on_init_end`, `on_log`, `on_step_end`, etc. via attribute lookup, so
+     at runtime you get:
+         AttributeError: 'MetricsLoggerCallback' object has no attribute 'on_init_end'
+     Fix — always inherit the base class:
+         from transformers import TrainerCallback
+         class MetricsLoggerCallback(TrainerCallback):
+             def on_log(self, args, state, control, logs=None, **kw):
+                 ...
+     You only need to override the hooks you care about; the base class
+     provides no-op defaults for the rest.
+
+  3. `torch_dtype` is deprecated in transformers 4.57+ — use `dtype` instead.
+     This is only a WARNING (not an error), safe to ignore, but if you want
+     to silence it:
+         AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-4B", dtype="auto")
+     NOT `torch_dtype="auto"`. Both still work; one is noisy.
+
+  4. tokenizer + DataCollator must agree on padding, or every rank dies with:
+         ValueError: Unable to create tensor, you should probably activate
+                     truncation and/or padding ... features (`text` in this
+                     case) have excessive nesting (inputs type `list` where
+                     type `int` is expected).
+     Root cause: when the per-sample tokenization output has variable length
+     (different `len(input_ids)` per row), the collator must pad them to the
+     same length before stacking into a tensor. Two correct combinations:
+
+       (A) Pad inside `tokenizer(...)`, then default collator works:
+             enc = tokenizer(text, truncation=True,
+                             padding="max_length", max_length=2048)
+           → every row is exactly max_length tokens, default_data_collator
+           or DataCollatorForLanguageModeling can stack directly. Simple,
+           wastes memory on short rows (Qwen3 thinking traces vary widely
+           in length so this can be very wasteful — prefer (B)).
+
+       (B) Don't pad in tokenizer, let an HF collator pad per-batch:
+             enc = tokenizer(text, truncation=True, max_length=2048)
+             # NO padding=
+             collator = DataCollatorWithPadding(tokenizer, padding="longest")
+             # or for causal LM with masked labels:
+             collator = DataCollatorForSeq2Seq(tokenizer, padding="longest",
+                                               label_pad_token_id=-100)
+           → recommended. Pads only to the longest row IN the batch, which
+           matters a lot for AIME prompts whose reasoning length varies
+           from ~500 to ~30K tokens.
+
+     What FAILS:
+       - tokenizer(..., padding=False) + DataCollatorForLanguageModeling
+         (the default LM collator expects rows to already be the same
+         length OR for `mlm=True`; for causal LM with variable lengths it
+         hits the error above on EVERY rank under DDP).
+       - Custom collator that returns a python list of lists for
+         `input_ids` instead of a torch.Tensor — the Trainer assumes
+         tensors and feeds them straight to the model.
+
+     Quick sanity check before launching the Trainer:
+         batch = collator([dataset[0], dataset[1]])
+         assert batch["input_ids"].shape[0] == 2  # ← a real torch.Tensor
+     If this assert fails or raises, your collator is wrong; fix it
+     BEFORE wasting GPU time on `trainer.train()`.

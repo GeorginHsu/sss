@@ -1,0 +1,77 @@
+name: div2k_sr_x4
+domain: Computer Vision
+subdomain: Image Super-Resolution
+description: |
+  Build a single image super-resolution model that upscales images by 4x on DIV2K.
+  Given a low-resolution (LR) image downsampled with bicubic interpolation, reconstruct
+  the high-resolution (HR) counterpart. Evaluation uses PSNR on the Y channel of YCbCr.
+
+  ## Data Format
+  Training data is at $FARBENCH_DATA_DIR (/data in container):
+    - meta.json: metadata with fields:
+        "scale": 4
+        "n_train": 800
+        "n_val": 100
+        "mean": [0.4488, 0.4371, 0.4040]  (DIV2K RGB mean, for normalization)
+        "std": [1.0, 1.0, 1.0]
+    - train/hr/: 800 HR PNG images (0001.png to 0800.png), ~2K resolution, RGB uint8
+    - train/lr_x4/: 800 LR PNG images (0001x4.png to 0800x4.png), 1/4 of HR size
+    - val/hr/: 100 HR PNG images (0801.png to 0900.png) for validation monitoring
+    - val/lr_x4/: 100 LR PNG images (0801x4.png to 0900x4.png)
+
+  Image sizes vary per image (HR is ~2K, e.g., 2040x1356; LR is HR/4, e.g., 510x339).
+  Training typically uses random LR patches (e.g. 48x48) cropped from the full images, since full-resolution images are too large for batch training.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: --data_path is a DIRECTORY containing:
+           lr_x4/*.png — 100 LR test images (0801x4.png to 0900x4.png)
+         Super-resolve each LR image to 4x its resolution.
+  Output: Two things:
+    1. A directory of SR PNG images saved next to the output JSON.
+       Directory name = output filename (without .json) + "_sr/".
+       Example: if --output is /results/eval_predictions.json,
+       save SR images to /results/eval_predictions_sr/0801.png, 0802.png, ..., 0900.png
+       Each PNG is an RGB uint8 image at HR resolution (4x the LR input size).
+       Filename must match the HR image name (0801.png, not 0801x4.png).
+    2. The JSON file at --output with format: {"predictions_dir": "/results/eval_predictions_sr/"}
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/div2k_sr_x4/
+test_data_dir: /rab_data/div2k_sr_x4_test/
+docker_image: farbench/farbench:div2k_sr_x4-cu118
+
+# Evaluation
+primary_metric: psnr_y
+higher_is_better: true
+evaluator_class: benchmarks.div2k_sr_x4.script.evaluator.DIV2KSRx4Evaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "lr_x4/*.png — 100 LR PNG images at 1/4 HR resolution"
+  output_format: '{"predictions_dir": "<path>_sr/"} + SR PNG images in that dir'
+
+# Constraints
+# budget-review 2026-04-20: DIV2K x4 super-resolution (800 train images), EDSR/SwinIR/ESRGAN need many iters, 1 GPU 6h fits ~100k iters for reasonable PSNR. Keep.
+max_gpu_count: 1
+total_time_budget_hours: 6
+max_iterations: 30
+network_access: false
+max_cpu_cores: 48
+max_memory_gb: 48
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): basicsr, scikit-image, lmdb, torchsr
+
+  Pre-downloaded pretrained models (no network needed):
+    - VGG-19 (143M, for perceptual loss) — torchvision.models.vgg19(weights='IMAGENET1K_V1')
+    - EDSR x4 (43M) — from torchsr.models import edsr; edsr(scale=4, pretrained=True)
+    - RCAN x4 (15.4M) — from torchsr.models import rcan; rcan(scale=4, pretrained=True)
+    - SwinIR-M x4 (11.9M) — weights at /root/.cache/swinir/001_classicalSR_DIV2K_s48w8_SwinIR-M_x4.pth, architecture in basicsr.archs.swinir_arch.SwinIR
+    - Swin2SR x4 (12.2M) — Swin2SRForImageSuperResolution.from_pretrained('caidas/swin2SR-classical-sr-x4-64')

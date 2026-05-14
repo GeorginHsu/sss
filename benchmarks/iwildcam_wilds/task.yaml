@@ -1,0 +1,107 @@
+name: iwildcam_wilds
+domain: AI for Science
+subdomain: Biodiversity Monitoring
+description: |
+  Build a 182-class wildlife species classifier from camera-trap images that generalizes to camera-trap locations NEVER seen during training (spatial OOD domain generalization). Evaluation metric is macro-F1 restricted to the set of classes that appear in the OOD test ground-truth (matches wilds.common.metrics.all_metrics.F1 with labels=torch.unique(y_true) — critical because many species are train-only or val-only; sklearn's default would penalize unseen classes and make our numbers incomparable to published baselines). Splits follow WILDS v2.0 protocol bit-for-bit (Koh et al., ICML 2021 / v2.0 CSV with split IDs 0=train, 1=val, 2=test, 3=id_val, 4=id_test; FARBench uses 0/1/2, drops id_val/id_test per leaderboard convention). Sample counts (WILDS published): train = 129,809 images from 243 locations (12 countries), val = 14,961 from 32 OOD locations, test = 42,791 from 48 OOD locations — train/val/test locations are strictly disjoint. Class distribution is extremely long-tailed: popular classes (empty frame, cattle, deer) have tens of thousands of samples while many rare species have fewer than 100 — this is why the benchmark uses macro-F1, not accuracy.
+
+  ## Data Format
+
+  Training data at $FARBENCH_DATA_DIR (/data in container, ~12 GB on disk):
+    - train.txt              : 129,809 lines of "<filename>.jpg {label}" (space-separated, label ∈ [0, 181], filenames whitespace-free)
+    - val.txt                : 14,961 lines, same format (OOD val, 32 held-out locations)
+    - location_labels_train.txt : 129,809 lines, one integer per line (aligned by line index to train.txt); location IDs are in [0, 242] (remapped to be contiguous)
+    - location_labels_val.txt   : 14,961 lines, same format as above (location IDs for val; the 32 val locations are disjoint from the 243 train locations, i.e. IDs here do NOT overlap with train's 0-242)
+    - class_names.txt        : 182 lines, one canonical species name per line (line index == class index 0-181; names loaded from categories.csv shipped with WILDS v2.0 bundle)
+    - images/                : flat directory of .jpg files (real files, ~145K total = train + val combined); fully self-contained, no external dependencies
+
+  Test data at $FARBENCH_TEST_DATA_DIR (/data in the eval container), given to predict.py:
+    - test.txt               : 42,791 lines of "<filename>.jpg" ONLY — no label column
+    - images/                : flat directory with the test .jpg files
+    (test_labels.txt also lives in this directory; it is used by the evaluator. predict.py MUST only read test.txt and images/ — reading test_labels.txt is considered cheating.)
+
+  Image spec:
+    - Format:     JPEG, RGB, 3 channels, 8-bit unsigned (pixel range 0-255)
+    - Size:       VARIABLE — most images are 1024x747 or similar "landscape" aspect; sizes range roughly 100 px to 2000 px per side. Not pre-resized. Agent must resize or crop in its own transform pipeline.
+    - Filename:   the basename of the original iWildCam file (e.g. "8a37a24a-21bc-11ea-a13a-137349068a90.jpg"); treat as an opaque identifier — do NOT try to parse metadata from the filename.
+    - Content:    RGB camera-trap photos captured by motion sensors in various biomes — savannah, jungle, forest, etc. Lighting varies (daytime color, nighttime IR/grayscale-like), occlusion varies, motion blur common.
+    - Normalization: pixel values are raw uint8 (0-255), NOT pre-normalized. Apply your model's own mean/std after loading.
+
+  Label encoding:
+    - Labels are integers in [0, 181] covering 182 species categories.
+    - class 0 = "empty" (no animal, triggered motion sensor by wind / foliage) — this is a real class in iWildCam and is included in macro-F1.
+    - Class distribution is HEAVILY long-tailed:
+        * 5-10 classes have > 5,000 training samples each (empty, common ungulates, livestock)
+        * ~50 classes have 100-5,000 samples (common mammals, birds)
+        * 100+ classes have fewer than 100 samples (rare species) — many have < 20 samples
+        * Many classes present in train are absent from val or test, and vice-versa. The evaluator restricts macro-F1 to classes that appear in y_true, so missing-from-test classes do not contribute.
+    - See class_names.txt for canonical names (may be generic "species_N" if categories.csv was unavailable during preparation — prepare.py prints a warning in that case).
+
+  Location encoding:
+    - 243 training locations + 32 OOD val locations + 48 OOD test locations = 323 total, location IDs in [0, 322] remapped to be contiguous in metadata.csv (column: location_remapped).
+    - location_labels_{train,val}.txt expose the remapped IDs for supervised training / domain-aware techniques. test locations are NOT revealed to the agent (no test location file is visible under $FARBENCH_TEST_DATA_DIR).
+    - Using location labels during training is optional; the predict.py contract does not require or forbid it.
+
+  Why this task is hard (context only, no method implied):
+    - Spatial OOD shift: backgrounds, vegetation, camera angle, and species composition differ dramatically across the 48 test locations; many test locations are in biomes underrepresented or absent in training.
+    - Long-tail + macro-F1: the metric weights every present-in-test class equally, so correctly recognizing rare species matters as much as common ones — a model that scores well on only common classes will have a low macro-F1.
+    - Visual variation within a class: the same species looks very different under daytime color vs. nighttime IR imagery, in dense foliage vs. open plains.
+
+  ## Predict Script Contract
+  You must create a predict.py that accepts these arguments:
+    python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+
+  Input: <test_data_dir> contains test.txt (one "<filename>.jpg" per line, NO labels) and images/ (the .jpg files referenced by test.txt).
+  Output: JSON file at <output.json> with format {"predictions": [42, 0, 181, 5, ...]}
+          One predicted class index (int in [0, 181]) per test sample, in the SAME order as test.txt lines. Length MUST equal len(test.txt) = 42,791.
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/iwildcam_wilds/
+test_data_dir: /rab_data/iwildcam_wilds_test/
+docker_image: farbench/farbench:iwildcam_wilds-cu118
+
+# Evaluation
+primary_metric: macro_f1
+higher_is_better: true
+evaluator_class: benchmarks.iwildcam_wilds.script.evaluator.IWildCamWILDSEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.txt with one '<filename>.jpg' per line + images/ directory (no labels)"
+  output_format: '{"predictions": [42, 0, 181, 5, ...]}'
+
+# Constraints
+# budget-review 2026-04-24: iWildCam-WILDS (train 130K / val 15K / test 43K, 182 long-tailed classes).
+# Target hardware: 4x RTX 6000 Ada (48GB each). Per card ~1.2x A100 FP16 TC => 4 cards ≈ 4.8x A100.
+# Literature single-run times on 1-2 A100 (CLIP ViT-L/14 fine-tune at 224): 3-6h on this dataset size.
+# Scaled to 4x 6000 Ada DDP: ~1.5-2.5h per ViT-L run, ~0.5-1h per ViT-B run.
+# 8h budget => agent has room for 3-4 full ViT-L training runs (matches skill's "5x single run" rule
+# loosely; iwildcam is larger than fmow so per-run is slightly longer, keeping a modest 8h).
+max_gpu_count: 4
+total_time_budget_hours: 8
+max_iterations: 30
+network_access: false
+# 4-GPU DDP with ~8 dataloader workers/GPU on variable-size JPEG decode + resize; 48 cores
+# keeps PIL/augmentation from bottlenecking IO. 96 GB RAM covers ~32 worker processes
+# (~1 GB each) + val-set pre-cache + DDP communication buffers
+# (default 48 GB is tight and risks OOM under persistent_workers / larger prefetch).
+max_cpu_cores: 48
+max_memory_gb: 96
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): wilds
+
+  Pre-downloaded pretrained models (no network needed, available via HuggingFace cache):
+  - openai/clip-vit-large-patch14 (CLIP ViT-L/14, 304M, 224x224 input)
+  - openai/clip-vit-base-patch16  (CLIP ViT-B/16,  150M, 224x224 input)
+  Load via:
+    from transformers import CLIPModel
+    model = CLIPModel.from_pretrained('openai/clip-vit-large-patch14')
+    # or: CLIPModel.from_pretrained('openai/clip-vit-base-patch16')
+
+  Multi-GPU runtime: the container exposes 4 GPUs (CUDA_VISIBLE_DEVICES=0,1,2,3).
+  Single-GPU training only uses 1/4 of available compute and is unlikely to fit
+  the time budget — use all 4 GPUs.

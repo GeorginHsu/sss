@@ -1,0 +1,158 @@
+name: minigrid
+domain: robotics
+subdomain: Navigation
+description: |
+  Train an RL agent to solve navigation and puzzle tasks in Minigrid
+  grid-world environments.
+
+  Your goal: train an RL policy that maximises success rate (primary metric)
+  across multiple Minigrid environments. You have complete research freedom —
+  choose any RL algorithm, network architecture, hyperparameters, and training
+  strategies (e.g., multi-task, curriculum learning, separate policies).
+
+  ## Environment
+
+  Minigrid is a lightweight Gymnasium-based library of discrete grid-world
+  environments. The agent (a triangle) navigates 2D grids with walls, doors,
+  keys, lava, and other obstacles.
+
+  Install: `pip install minigrid` (network access is enabled).
+
+  Observation space (dict):
+    - "image":     uint8 (7, 7, 3) — partial egocentric grid view.
+                   Each cell encodes (OBJECT_IDX, COLOR_IDX, STATE).
+    - "direction": Discrete(4) — agent facing direction.
+    - "mission":   str — natural language goal description.
+
+  Action space: Discrete(7)
+    0=turn left, 1=turn right, 2=move forward,
+    3=pickup, 4=drop, 5=toggle (open door), 6=done.
+
+  Reward: positive on success (higher for faster completion);
+  0 on failure (timeout / lava).
+
+  ## Training Environments (10 environments)
+
+  Use these environments for training:
+    - MiniGrid-DoorKey-8x8-v0
+    - MiniGrid-FourRooms-v0
+    - MiniGrid-KeyCorridorS3R3-v0
+    - MiniGrid-LockedRoom-v0
+    - MiniGrid-Dynamic-Obstacles-8x8-v0
+    - MiniGrid-LavaCrossingS9N2-v0
+    - MiniGrid-UnlockPickup-v0
+    - MiniGrid-MultiRoom-N4-S5-v0
+    - MiniGrid-LavaGapS7-v0
+    - MiniGrid-DistShift1-v0
+
+  ## Evaluation Environments (10 environments)
+
+  Evaluation uses the exact same environments as training (to measure
+  in-distribution generalisation via procedural generation using seeds 0-49).
+
+  Eval environments:
+    - MiniGrid-DoorKey-8x8-v0
+    - MiniGrid-FourRooms-v0
+    - MiniGrid-KeyCorridorS3R3-v0
+    - MiniGrid-LockedRoom-v0
+    - MiniGrid-Dynamic-Obstacles-8x8-v0
+    - MiniGrid-LavaCrossingS9N2-v0
+    - MiniGrid-UnlockPickup-v0
+    - MiniGrid-MultiRoom-N4-S5-v0
+    - MiniGrid-LavaGapS7-v0
+    - MiniGrid-DistShift1-v0
+
+  Each eval environment runs 50 episodes (seeds 0-49) → 500 episodes total.
+
+  ## Quick-start Example
+
+    import gymnasium as gym
+    import minigrid
+
+    env = gym.make("MiniGrid-Empty-8x8-v0", render_mode="rgb_array")
+    obs, info = env.reset(seed=0)
+    for step in range(env.max_steps):
+        action = policy.predict(obs)  # your RL policy
+        obs, reward, terminated, truncated, info = env.step(action)
+        if terminated or truncated:
+            break
+
+  ## Predict Script Contract
+
+  You MUST create predict.py in /workspace that:
+    1. Loads your trained policy from --checkpoint directory.
+    2. Runs the 10 evaluation environments (50 episodes each, seeds 0-49).
+    3. Writes a JSON results file to --output.
+
+  Invocation:
+    python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>
+
+  Output JSON format (required):
+    {
+      "success_rate": 0.85,
+      "mean_reward": 0.72,
+      "per_env": {
+        "MiniGrid-DoorKey-8x8-v0":            {"mean_reward": 0.45, "success_rate": 0.58},
+        "MiniGrid-FourRooms-v0":              {"mean_reward": 0.40, "success_rate": 0.52},
+        "MiniGrid-KeyCorridorS3R3-v0":        {"mean_reward": 0.42, "success_rate": 0.55},
+        "MiniGrid-LockedRoom-v0":             {"mean_reward": 0.38, "success_rate": 0.48},
+        "MiniGrid-Dynamic-Obstacles-8x8-v0":  {"mean_reward": 0.30, "success_rate": 0.40},
+        "MiniGrid-LavaCrossingS9N2-v0":       {"mean_reward": 0.35, "success_rate": 0.45},
+        "MiniGrid-UnlockPickup-v0":           {"mean_reward": 0.50, "success_rate": 0.60},
+        "MiniGrid-MultiRoom-N4-S5-v0":        {"mean_reward": 0.48, "success_rate": 0.56},
+        "MiniGrid-LavaGapS7-v0":              {"mean_reward": 0.32, "success_rate": 0.42},
+        "MiniGrid-DistShift1-v0":             {"mean_reward": 0.44, "success_rate": 0.54}
+      },
+      "total_episodes": 500
+    }
+
+  success_rate is the fraction of episodes with reward > 0 (primary metric).
+  mean_reward is the average reward across all 500 episodes.
+  per_env contains the same metrics broken down by environment.
+
+  ## Execution Priority
+
+  Submit evaluation after each training run to track progress.
+  Iterate based on eval results — do not train multiple times without evaluating.
+
+  ## Constraints
+
+  - Network architecture is free but total parameters must be ≤ 10M.
+  - You may use any RL algorithm and observation wrappers as needed.
+
+compute_type: gpu
+max_gpu_count: 1
+total_time_budget_hours: 10
+max_iterations: 30
+network_access: false
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/minigrid/
+test_data_dir: /rab_data/minigrid_test/
+docker_image: farbench/farbench:minigrid-cu118
+
+# Evaluation
+primary_metric: success_rate
+higher_is_better: true
+evaluator_class: benchmarks.minigrid.script.evaluator.MinigridEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt_dir> --output <output.json>"
+  input_format: "data_path contains eval_config.json with eval_envs, episodes_per_env, seed_start, seed_end"
+  output_format: '{"success_rate": 0.55, "mean_reward": 0.45, "per_env": {"MiniGrid-FourRooms-v0": {"mean_reward": 0.45, "success_rate": 0.58}, ...}, "total_episodes": 500}'
+
+agent_hints: |
+  Pre-installed task packages (do NOT reinstall): gymnasium, minigrid, stable-baselines3, shimmy, torch, numpy
+
+  IMPORTANT RULES for this task:
+  - You MUST use real Minigrid environments (gymnasium + minigrid) for training.
+    Do NOT create mock/fake/simplified environments. The evaluator runs your policy
+    in real Minigrid environments — any policy not trained on Minigrid will score 0.
+  - Training data is collected by interacting with Minigrid environments (on-policy RL).
+    There is no static dataset to load.
+  - eval_config.json in $FARBENCH_TEST_DATA_DIR lists the exact evaluation environments,
+    episodes_per_env, and seed range. Your predict.py should read this file.
+  - Do NOT waste iterations on environment exploration. The observation/action spaces
+    are fully described in the task description. Start coding immediately.

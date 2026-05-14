@@ -1,0 +1,134 @@
+# farbench/farbench:base-py312-cuNNN — Python 3.12 base image for FARBench
+# tasks that need Python 3.12 (e.g. vlabench_manipulation, which depends on
+# lerobot[pi]==0.5.1 — that package's pyproject.toml hard-requires
+# Python >= 3.12).
+#
+# Mirrors docker/Dockerfile.base structure (same package groups, same env
+# vars, same FARBench install) — the only difference is the Python interpreter.
+#
+# Build cu118:
+#   docker build --network=host \
+#     -t farbench/farbench:base-py312-cu118 -f docker/Dockerfile.base.py312 .
+# Build cu128:
+#   docker build --network=host \
+#     -t farbench/farbench:base-py312-cu128 -f docker/Dockerfile.base.py312 \
+#     --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu22.04 \
+#     --build-arg CUDA_TAG=cu128 .
+
+ARG BASE_IMAGE=nvidia/cuda:11.8.0-runtime-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+ARG CUDA_TAG=cu118
+
+# Why we don't use deadsnakes PPA: this build host's docker NAT egress
+# blocks `ppa.launchpadcontent.net` (and `api.launchpad.net` and
+# `keyserver.ubuntu.com`) — even with `--network=host`, all
+# Canonical/Launchpad services time out from inside containers, while
+# Ubuntu's archive mirrors and GitHub/Anaconda CDNs remain reachable.
+# So we install Python 3.12 from `python-build-standalone` (the
+# upstream that `uv python install` uses) — a self-contained CPython
+# tarball hosted on GitHub releases, no PPA / no apt key dance.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Step 1: stock system deps (Ubuntu archive mirrors only, all reachable).
+# policy-rc.d shim prevents dbus / systemd post-install triggers from
+# blocking forever in containers without an init system.
+RUN echo 'exit 101' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        git curl wget ca-certificates xz-utils \
+        libgl1-mesa-glx libglib2.0-0 libsndfile1 ffmpeg \
+ && rm /usr/sbin/policy-rc.d \
+ && rm -rf /var/lib/apt/lists/*
+
+# Step 2: install uv (Astral's package manager; ~5 MB single binary
+# from astral.sh — confirmed reachable on this host) and use it to
+# fetch a portable CPython 3.12 from GitHub releases. Install it at
+# /opt/python (stable, predictable path) and symlink as
+# /usr/local/bin/python3.12 + update-alternatives so `python` resolves
+# to 3.12 by default.
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+ && /root/.local/bin/uv python install 3.12 \
+ && PYBIN="$(/root/.local/bin/uv python find 3.12)" \
+ && ln -sf "$PYBIN" /usr/local/bin/python3.12 \
+ && update-alternatives --install /usr/bin/python  python  /usr/local/bin/python3.12 1 \
+ && update-alternatives --install /usr/bin/python3 python3 /usr/local/bin/python3.12 1 \
+ # python-build-standalone (what `uv python install` fetches) ships a
+ # PEP-668 EXTERNALLY-MANAGED marker that blocks system-wide pip
+ # installs ("error: externally-managed-environment"). Remove it so
+ # `pip install` works like a normal CPython distribution; this image
+ # is single-purpose (FARBench tasks) so PEP 668's protection isn't useful
+ # to us here.
+ && find /opt/python -name EXTERNALLY-MANAGED -delete \
+ && curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
+ && python /tmp/get-pip.py \
+ && rm /tmp/get-pip.py
+
+# Sanity check: default `python` is 3.12 and pip is hooked up.
+RUN python --version | grep -q '3\.12' \
+ && python -m pip --version
+
+# Docker CLI — talks to the host daemon via the mounted socket
+# (/var/run/docker.sock) for DooD task container management.
+COPY --from=docker:24-cli /usr/local/bin/docker /usr/local/bin/docker
+
+# Common ML dependencies (resolved for Python 3.12).
+# We do NOT pin specific versions here: pip picks whatever is compatible
+# at base-build time. Tasks needing exact pins (e.g. vlabench_manipulation
+# pinning transformers==5.3.0 because lerobot[pi]==0.5.1 hard-pins it)
+# install pin overrides in their own task Dockerfile.
+
+# Group 1: PyTorch ecosystem
+RUN python -m pip install --no-cache-dir \
+        torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/${CUDA_TAG}
+
+# Group 2: Core scientific computing & data handling
+RUN python -m pip install --no-cache-dir \
+        numpy scipy pandas pyyaml pillow nvidia-ml-py \
+        scikit-learn h5py tqdm
+
+# Group 3: Visualization & experiment tracking
+RUN python -m pip install --no-cache-dir \
+        tensorboard matplotlib
+
+# Group 4: NLP / HuggingFace ecosystem
+RUN python -m pip install --no-cache-dir \
+        transformers datasets accelerate evaluate \
+        tokenizers sentencepiece
+
+# Group 5: Computer Vision
+RUN python -m pip install --no-cache-dir \
+        timm torchmetrics einops \
+        albumentations opencv-python-headless
+
+# Group 6: Audio processing
+RUN python -m pip install --no-cache-dir \
+        librosa soundfile
+
+# Upgrade pip + setuptools (farbench pyproject.toml needs setuptools>=68 to
+# read modern [project] metadata; Ubuntu's apt setuptools is too old).
+RUN python -m pip install --no-cache-dir --upgrade pip "setuptools>=68.0" wheel
+
+# Install FARBench package
+WORKDIR /opt/farbench
+COPY pyproject.toml .
+COPY farbench/ farbench/
+COPY cli/ cli/
+RUN python -m pip install --no-cache-dir .
+
+# Default working directory for tasks
+WORKDIR /workspace
+
+# Environment variables expected by training scripts
+ENV FARBENCH_TRAINING_LOG_DIR=/workspace/logs \
+    FARBENCH_CHECKPOINT_DIR=/workspace/checkpoints \
+    FARBENCH_DATA_DIR=/workspace/data \
+    FARBENCH_SEED=42
+
+# Clear the NVIDIA base image entrypoint so task containers and the harness
+# can set their own entry command without the nvidia_entrypoint.sh wrapper.
+ENTRYPOINT []
+CMD ["python"]

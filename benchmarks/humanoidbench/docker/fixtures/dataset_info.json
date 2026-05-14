@@ -1,0 +1,23 @@
+{
+  "task": "humanoidbench",
+  "training_mode": "online_rl",
+  "training_data": "agent-generated rollouts in MuJoCo",
+  "static_dataset": null,
+  "robot": "h1hand",
+  "robot_notes": "Unitree H1 (19-dof body) + 2x Shadow Hand (21-dof each). action_space is Box(-1, 1, (61,), float32) — uniform across all 10 eval tasks, so a single multi-task policy can output one 61-D action vector for every task.",
+  "action_space": {"shape": [61], "low": -1.0, "high": 1.0, "dtype": "float32"},
+  "obs_space_notes": "observation_space is Box(-inf, inf, (D,), float64) where D depends on the task because manipulation tasks append object state (box pose+vel, door angle, package pose, etc.) to the proprioceptive H1+hand state. See `eval_tasks` for per-task D.",
+  "eval_tasks": [
+    {"task_id": "h1hand-walk-v0",           "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   700, "info_keys_after_step": ["dont_move", "per_timestep_reward", "small_control", "stand_reward", "standing", "upright"]},
+    {"task_id": "h1hand-stand-v0",          "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   800, "info_keys_after_step": ["dont_move", "per_timestep_reward", "small_control", "stand_reward", "standing", "upright"]},
+    {"task_id": "h1hand-run-v0",            "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   700, "info_keys_after_step": ["move", "per_timestep_reward", "small_control", "stand_reward", "standing", "upright"]},
+    {"task_id": "h1hand-sit_simple-v0",     "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   750, "info_keys_after_step": ["dont_move", "per_timestep_reward", "sit_reward", "sitting", "sitting_posture", "small_control", "upright"]},
+    {"task_id": "h1hand-balance_simple-v0", "obs_dim": 164, "max_episode_steps": 1000, "success_bar":   800, "info_keys_after_step": ["dont_move", "per_timestep_reward", "small_control", "stand_reward", "standing", "upright"]},
+    {"task_id": "h1hand-reach-v0",          "obs_dim": 157, "max_episode_steps": 1000, "success_bar": 12000, "info_keys_after_step": ["hand_dist", "healthy_reward", "motion_penalty", "per_timestep_reward", "reward_close", "reward_success"]},
+    {"task_id": "h1hand-push-v0",           "obs_dim": 163, "max_episode_steps":  500, "success_bar":   700, "info_keys_after_step": ["hand_dist", "per_timestep_reward", "reward_success", "success", "target_dist"]},
+    {"task_id": "h1hand-pole-v0",           "obs_dim": 151, "max_episode_steps": 1000, "success_bar":   700, "info_keys_after_step": ["collision_discount", "move", "per_timestep_reward", "small_control", "stand_reward", "standing", "upright"]},
+    {"task_id": "h1hand-door-v0",           "obs_dim": 155, "max_episode_steps": 1000, "success_bar":   600, "info_keys_after_step": ["door_hatch_openness_reward", "door_openness_reward", "hand_hatch_proximity_reward", "passage_reward", "per_timestep_reward", "small_control", "stand_reward"]},
+    {"task_id": "h1hand-package-v0",        "obs_dim": 173, "max_episode_steps": 1000, "success_bar":  1500, "info_keys_after_step": ["dist_hand_package_left", "dist_hand_package_right", "dist_package_destination", "package_height", "per_timestep_reward", "small_control", "stand_reward", "success"]}
+  ],
+  "info_after_reset": "env.reset(seed=k) returns (obs, info) where info is an empty dict {}. All useful per-step signals (including success for push/package) appear AFTER env.step()."
+}

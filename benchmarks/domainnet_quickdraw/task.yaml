@@ -1,0 +1,237 @@
+name: domainnet_quickdraw
+domain: computer vision
+subdomain: Domain Generalization
+description: |
+  Train a 345-way image classifier on 5 source visual domains (Clipart, Infograph, Painting, Real, Sketch) that generalizes to a held-out 6th target domain, Quickdraw — hand-drawn sketches from Google Quick, Draw!. This is the standard DomainBed leave-one-domain-out DG protocol on **DomainNet-345 cleaned version** (Peng et al., ICCV 2019). The source domains contain photographs / clipart / paintings with rich color and texture; Quickdraw contains sparse black-stroke line drawings at 300×300 RGB PNG on white background rendered from simplified vector strokes via B-spline. The domain gap is extreme — published top-1 accuracy on Quickdraw caps around 17% (ERM++ WACV'25 17.3%, DPSPG 2025 17.22%) even though the same backbones reach 60%+ on Real/Clipart targets, so very-low absolute numbers are expected and correct.
+
+  ## Data Format
+
+  ### Directory layout
+
+  Training data is at `$FARBENCH_DATA_DIR` (mounted as `/data` in the agent container):
+
+  ```
+  $FARBENCH_DATA_DIR/
+      train.txt            330,583 lines, format "<relative_path> <label>" (space-separated)
+      val.txt               83,492 lines, same format; stratified 80/20 hold-out
+                            of the combined source train+test splits (seed=42,
+                            stratified by (domain, class))
+      domain_labels.txt    330,583 lines, one integer per line; the line at index i
+                            is the domain ID of train.txt line i
+                            (0=clipart, 1=infograph, 2=painting, 3=real, 4=sketch)
+      class_names.txt      345 lines; line index i == label index i
+                            (line 0 = aircraft_carrier, line 1 = airplane,
+                             line 2 = alarm_clock, line 3 = ambulance,
+                             line 4 = angel, line 5 = animal_migration, line 6 = ant,
+                             …, line 343 = zebra, line 344 = zigzag)
+      images/
+          clipart/<class_name>/<file>.jpg     48,129 files referenced (~1.3 GB)
+          infograph/<class_name>/<file>.jpg   51,605 files referenced (~4.0 GB)
+          painting/<class_name>/<file>.jpg    72,266 files referenced (~3.7 GB)
+          real/<class_name>/<file>.jpg       172,947 files referenced (~5.6 GB)
+          sketch/<class_name>/<file>.jpg      69,128 files referenced (~2.5 GB)
+  ```
+
+  Source-domain totals: **414,075 images** (cleaned version, combined official train+test),
+  disk footprint ≈ **17 GB**. Split counts come from the cleaned `<domain>_{train,test}.txt`
+  files at `csr.bu.edu/ftp/visda/2019/multi-source/domainnet/txt/`. Note: the images/
+  directories may contain a few hundred additional files per domain (the raw uncleaned
+  zip contents); only files referenced in train.txt / val.txt are part of the protocol.
+
+  Test data is at `$FARBENCH_TEST_DATA_DIR` (also mounted as `/data` during evaluation):
+
+  ```
+  $FARBENCH_TEST_DATA_DIR/
+      test.txt             172,500 lines, format "<relative_path>" (no label, no header)
+      images/
+          quickdraw/<class_name>/<key_id>.png   172,500 PNG files (~439 MB total)
+  ```
+
+  Quickdraw is **exactly 500 images per class × 345 classes = 172,500** (uniformly class-balanced — this is why the evaluator can report plain `accuracy`; balanced_accuracy differs by <1 pp in practice).
+
+  ### Example lines
+
+  `train.txt` — (path, label) pairs space-separated:
+  ```
+  real/airplane/real_012_000001.jpg 1
+  clipart/aircraft_carrier/clipart_001_000018.jpg 0
+  sketch/alarm_clock/sketch_003_000034.jpg 2
+  painting/tiger/painting_293_001234.jpg 309
+  infograph/wine_glass/infograph_337_000567.jpg 335
+  ```
+
+  `test.txt` — path only, one per line:
+  ```
+  quickdraw/airplane/6240401310613504.png
+  quickdraw/ant/5013280843857920.png
+  quickdraw/zebra/4986254852390912.png
+  ```
+
+  `class_names.txt` — alphabetically ordered, underscores join multi-word names:
+  ```
+  aircraft_carrier      # label 0
+  airplane              # label 1
+  alarm_clock           # label 2
+  ambulance             # label 3
+  angel                 # label 4
+  animal_migration      # label 5
+  ant                   # label 6
+  …
+  zebra                 # label 343
+  zigzag                # label 344
+  ```
+
+  Class-name quirks: three classes use CamelCase with underscores (`The_Eiffel_Tower`,
+  `The_Great_Wall_of_China`, `The_Mona_Lisa`) and sort under capital "T" in default
+  Python `sorted()` order; one class is hyphenated (`t-shirt`). **Always read the
+  authoritative mapping from `class_names.txt`**, don't reconstruct it from scratch.
+
+  ### Image format per domain
+
+  Source domains (training):
+    - **Clipart** — stylized illustrations, `.jpg`, variable resolution (often ≥500 px), RGB.
+    - **Infograph** — infographic-style images with text/chart overlays, `.jpg`, often 1000+ px, RGB.
+    - **Painting** — fine-art paintings, `.jpg`, variable, RGB.
+    - **Real** — natural photographs, `.jpg`, highest volume and resolution, RGB.
+    - **Sketch** — pencil/ink sketches, `.jpg`, variable, stored as RGB JPEG (content is mostly
+      near-grayscale; content color ≈ grayscale but file is 3-channel).
+
+  Target domain (evaluation):
+    - **Quickdraw** — black strokes on white background rendered from Google Quick, Draw!
+      simplified vector strokes via B-spline, written as `.png` at **300 × 300 RGB**
+      (mode='RGB', 3 channels), avg ≈ 2.5 KB/image. Pretrained ImageNet backbones can
+      read these directly; a defensive `Image.open(p).convert('RGB')` is still recommended
+      in case any file downloads as grayscale.
+
+  ### Image size and normalization conventions
+
+  DG papers on DomainNet uniformly use **224 × 224 RGB with ImageNet normalization**:
+  `mean = [0.485, 0.456, 0.406]`, `std = [0.229, 0.224, 0.225]`. Input tensor shape is
+  `(3, 224, 224)`, `num_classes = 345`. Any source-image resolution / aspect ratio is fine
+  on the encoder side; downstream shape must be 224 × 224 after your preprocessing.
+
+  ### Using domain labels (optional)
+
+  `domain_labels.txt` gives per-sample domain IDs for every training example. Domain-aware
+  methods read it to group minibatches by domain or compute inter-domain statistics; plain
+  methods can ignore it.
+
+  ### Practical data-loading notes
+
+  - Image extensions are **mixed**: source domains are `.jpg`, Quickdraw test is `.png`. Any
+    custom file globber must include both.
+  - `torchvision.datasets.ImageFolder(root=images/)` on the **train** side will auto-assign
+    labels by alphabetical folder order, which matches `class_names.txt` exactly — but will
+    treat each domain subfolder as a top-level class, producing 5 × 345 = 1725 "classes".
+    Prefer to read `train.txt` / `val.txt` directly (label is column 2) instead of using
+    `ImageFolder` naively.
+  - Memory footprint of decoded batch: `bs × 3 × 224 × 224 × 4 bytes` → a batch of 160 is
+    ~96 MB in fp32 (~48 MB in fp16). Both GPUs fit comfortably.
+  - **Test-set paths contain class names** (e.g., `quickdraw/airplane/…png`). Do NOT parse
+    the class segment to construct predictions — the directory layout is a mirror of the
+    training structure, and an honest evaluator run requires predicting from pixels alone.
+
+  ## Predict Script Contract
+
+  You must create a `predict.py` in your workspace that is invoked as:
+
+  ```
+  python predict.py --data_path <test_data_dir> --checkpoint <model_checkpoint> --output <output.json>
+  ```
+
+  - `--data_path` points to `$FARBENCH_TEST_DATA_DIR` (i.e. `/data` inside the eval container),
+    containing `test.txt` and `images/quickdraw/<class>/<id>.png`.
+  - `--checkpoint` is whatever artifact you saved during training (any format you choose —
+    `.pt`, `.safetensors`, a directory — as long as your `predict.py` loads it).
+  - `--output` is the path your script must write the predictions JSON to.
+
+  **Input**: `test.txt` lists 172,500 relative image paths, one per line, no header, no labels.
+  Load each image, apply your eval preprocessing (224×224 resize + ImageNet normalization
+  is the safe default), batch through your trained model, and record the argmax class index
+  in `[0, 344]`.
+
+  **Output**: Write a JSON file at `--output` with exactly one top-level key `predictions`:
+
+  ```json
+  {"predictions": [42, 0, 344, 7, 3, ...]}
+  ```
+
+  The list length must equal the number of lines in `test.txt` (172,500), **in the same
+  order as test.txt**. Each entry is an `int` class index in `[0, 344]`. A length mismatch
+  raises `ValueError` during evaluation. The evaluator computes top-1 accuracy (primary)
+  and balanced_accuracy (secondary).
+
+compute_type: gpu
+
+# Paths
+script_dir: script/
+data_dir: /rab_data/domainnet_quickdraw/
+test_data_dir: /rab_data/domainnet_quickdraw_test/
+docker_image: farbench/farbench:domainnet_quickdraw-cu118
+
+# Evaluation
+# primary_metric: plain top-1 accuracy, matching the DomainBed/ERM++/DPSPG convention
+# used by every DG paper (DomainBed `misc.py::accuracy`, ERM++ WACV'25 Table 10,
+# DPSPG arXiv:2505.18770 Table IV, High-Rate Mixout arXiv:2510.06955 Table 9).
+# Quickdraw's test set is class-balanced (~500 imgs/class × 345), so balanced_accuracy ≈ accuracy (<1 pp),
+# but we report plain accuracy to be directly comparable with published numbers.
+primary_metric: accuracy
+higher_is_better: true
+evaluator_class: benchmarks.domainnet_quickdraw.script.evaluator.DomainNetEvaluator
+
+eval_contract:
+  predict_script: predict.py
+  invocation: "python predict.py --data_path <test_data_dir> --checkpoint <ckpt> --output <output.json>"
+  input_format: "test.txt with lines of 'relative_path' + images/ directory with Quickdraw sketches (no labels)"
+  output_format: '{"predictions": [42, 0, 344, 7, ...]}'
+
+# Constraints
+# budget-review 2026-04-24: updated from the 2026-04-20 review after cross-checking paper wall-clocks.
+# Realistic single-run wall-clocks on 1×A100-class GPU (224x224, AMP):
+#   - ResNet-50 DomainBed ERM (5K steps × bs160):      ~10 min
+#   - ERM++ ResNet-50 (~60K steps on DomainNet):       ~1.5–2h
+#   - CLIP ViT-B/16 full fine-tune, ~10 epochs:        ~1.5–2.5h
+#   - DINOv2 ViT-B/14 full fine-tune, ~10 epochs:      ~2–3h
+# With 4 GPUs (DDP) these halve. 10h thus fits 4–5 ViT-B fine-tune runs or 10+ ResNet-50 ERM runs.
+# max_gpu_count=4 is slightly above the DomainBed 1-GPU protocol, kept to accommodate
+# agents that use DDP for ViT-B at batch ≥256. max_iterations was 3 (early debug leftover), restored to 30.
+max_gpu_count: 4
+total_time_budget_hours: 10
+max_iterations: 30
+network_access: false
+
+# CPU & memory sizing (host has 144 cores / 1.9 TB RAM):
+#   - 24 cores covers 2 GPU × ~8-10 dataloader workers/GPU (≈ 18 cores active),
+#     leaving headroom for the main loop, transforms, and DDP communication.
+#   - Memory bumped from default 48 GB to 64 GB. Reason: with 16 persistent workers
+#     (~1 GB each = 16 GB), 4 cached pretrained backbones (~1.4 GB), DDP buffers,
+#     and an in-memory val-set cache (≈ 12 GB uint8 / ≈ 50 GB float32 for ~83K
+#     224×224 RGB images), 48 GB is tight (precedent: wilds_fmow comment, same
+#     scale at 4 GPU runs 96 GB). 64 GB gives ~50% headroom over expected peak.
+max_cpu_cores: 48
+max_memory_gb: 96
+
+agent_hints: |
+  Pre-downloaded pretrained backbones (no network needed). All four are paper-verified
+  choices for DomainNet DG; pretraining-data labels indicate which Quickdraw published
+  baselines are directly comparable.
+
+    - ResNet-50 IN-1k V1 (25M, supervised on ImageNet-1k)
+        → torchvision.models.resnet50(weights='IMAGENET1K_V1')
+        Used by DomainBed / ERM / ERM++ / MIRO / SWAD / DiWA. NOTE: V1 weights, not V2.
+
+    - ViT-B/16 IN-1k AugReg (86M, supervised on ImageNet-1k, AugReg recipe)
+        → timm.create_model('vit_base_patch16_224.augreg_in1k', pretrained=True)
+        Used by ERM++ WACV 2025 Table 3(b) ablation as the supervised-IN-1k transformer.
+
+    - CLIP ViT-B/16 (86M, vision-language pretrained on web image-text pairs)
+        → timm.create_model('vit_base_patch16_clip_224.openai', pretrained=True)
+        Used by CoOp / CoCoOp / MaPLe / SPG / DPSPG / CLIPCEIL — all CLIP-DG papers.
+
+    - DINOv2 ViT-B/14 (86M, self-supervised on LVD-142M)
+        → transformers.AutoModel.from_pretrained('facebook/dinov2-base')
+        Used by ERM++ Table 3(b) ablation; strong 2024-2025 SSL backbone for OOD features.
+
+  Multi-GPU runtime: the container exposes 4 GPUs (CUDA_VISIBLE_DEVICES=0,1,2,3).
+  Single-GPU training only uses 1/4 of available compute and is unlikely to fit
+  the time budget — use all GPUs.
